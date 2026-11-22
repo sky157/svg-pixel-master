@@ -26,6 +26,9 @@ const (
 // normalizeTransport 补齐零值，避免调用方传空结构时出现 0 超时 / 0 重试。
 func normalizeTransport(t Transport) Transport {
 	d := DefaultTransport()
+	if t.NoTimeout {
+		d.NoTimeout = true
+	}
 	if t.Timeout > 0 {
 		d.Timeout = t.Timeout
 	}
@@ -40,6 +43,10 @@ func normalizeTransport(t Transport) Transport {
 	}
 	if t.MaxRetryDelay > 0 {
 		d.MaxRetryDelay = t.MaxRetryDelay
+	}
+	if d.NoTimeout {
+		d.Timeout = 0
+		d.IdleTimeout = 0
 	}
 	return d
 }
@@ -103,10 +110,16 @@ func (d *doer) do(ctx context.Context, build func() (*http.Request, error)) (*ht
 		cctx, cancel := context.WithCancel(req.Context())
 		req = req.WithContext(cctx)
 		// 首字节超时：拿到响应头之前若超时则取消请求；拿到后立即停表，不影响长流。
-		timer := time.AfterFunc(d.t.Timeout, cancel)
+		// 0 表示不设超时（用户可手动停止）。
+		var timer *time.Timer
+		if d.t.Timeout > 0 {
+			timer = time.AfterFunc(d.t.Timeout, cancel)
+		}
 
 		resp, err := d.c.Do(req)
-		timer.Stop()
+		if timer != nil {
+			timer.Stop()
+		}
 		if err != nil {
 			cancel()
 			if ctxErr := ctx.Err(); ctxErr != nil {

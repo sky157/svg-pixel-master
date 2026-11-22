@@ -38,6 +38,43 @@ const (
 	GenModeAnim   = "anim"
 )
 
+// 单次模型响应的「无数据」容忍时长（秒）。
+//
+// 语义与 Transport.Timeout / IdleTimeout 一致：首字节等待与流中途空闲共用同一个值，
+// 只要连接还在吐数据就不会被打断，因此长 SVG 生成不会被总时长掐断。
+// 0 / 缺失 → 默认值；TimeoutSecNoLimit(-1) → 完全不超时（只能手动停止）；
+// 超出上限的脏值回落到默认值。
+const (
+	DefaultTimeoutSec = 600
+	TimeoutSecMax     = 3600
+	TimeoutSecNoLimit = -1
+)
+
+// NormalizeTimeoutSec 把超时设置归一到合法区间。
+func NormalizeTimeoutSec(sec int) int {
+	switch {
+	case sec == TimeoutSecNoLimit:
+		return TimeoutSecNoLimit
+	case sec >= 30 && sec <= TimeoutSecMax:
+		return sec
+	}
+	return DefaultTimeoutSec
+}
+
+// Agent 默认与上限：多图层模式按图层逐步改，轮数上限要比一次成图宽松得多。
+const (
+	DefaultMaxSteps = 80
+	MaxStepsLimit   = 200
+)
+
+// NormalizeMaxSteps 把步数上限归一到合法区间。
+func NormalizeMaxSteps(n int) int {
+	if n <= 0 || n > MaxStepsLimit {
+		return DefaultMaxSteps
+	}
+	return n
+}
+
 // ValidGenMode 判断生成方式是否合法；空串视为未设置。
 func ValidGenMode(m string) bool {
 	switch m {
@@ -187,6 +224,9 @@ type AgentSettings struct {
 	CompressOn     bool `json:"compressOn"`     // 是否启用上下文压缩
 	CompressAt     int  `json:"compressAt"`     // 触发 nudge 的窗口占比（百分比）
 	StreamDisabled bool `json:"streamDisabled"` // 网关不支持流式时的兜底
+	// TimeoutSec 单次响应「无任何数据」的容忍时长（秒）：首字节等待与流中途空闲共用。
+	// 只要连接还在吐数据就不会被打断；0/缺失按默认值处理，-1 表示不限时。
+	TimeoutSec int `json:"timeoutSec"`
 	// GenMode 生成方式，左栏三级开关的唯一真源：quick / layers / anim。
 	// 由它派生 MultiStep 与图层工具下发；见 GenMode* 常量。
 	GenMode string `json:"genMode"`
@@ -265,9 +305,10 @@ func DefaultSettings() Settings {
 		ActiveModel:      "",
 		Thinking:         "off",
 		Agent: AgentSettings{
-			MaxSteps:   40,
+			MaxSteps:   DefaultMaxSteps,
 			CompressOn: true,
 			CompressAt: 75,
+			TimeoutSec: DefaultTimeoutSec,
 			GenMode:    GenModeLayers,
 			MultiStep:  true,
 		},

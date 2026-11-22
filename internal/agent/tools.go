@@ -25,21 +25,39 @@ const (
 	ToolAskUser       = "ask_user"
 )
 
+// emitSVGSpec 构造 emit_svg 的工具声明。
+//
+// 同一条工具在两种模式下语义不同：快速/动图模式它是「整幅画面的唯一交付通道」，
+// 多图层模式它只能覆盖当前图层（分层交付走 create_layer / edit_layer）。
+// 描述必须跟着模式走，否则模型在多图层模式下会继续用 emit_svg 一次性整图。
+func emitSVGSpec(layers bool) llm.ToolSpec {
+	desc := "交付最终 SVG。原样交付，不做任何改写：只在内部校验结构与画布尺寸。这是唯一的交付通道，必须调用。返回校验报告 JSON。"
+	svgDesc := "完整 SVG 源码，含 <svg> 根元素，不要代码块围栏"
+	if layers {
+		desc = "用整段 SVG 覆盖**当前图层**（不是整幅画面）。只在确实要整层重画时使用；" +
+			"分层交付请改用 create_layer / edit_layer。返回校验报告 JSON。"
+		svgDesc = "该图层的完整 SVG 内容，可以是完整 <svg>（viewBox 必须等于画布规范），也可以是裸片段（<g>/<path>/<rect>…）"
+	}
+	params := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"svg":  map[string]any{"type": "string", "description": svgDesc},
+			"note": map[string]any{"type": "string", "description": "一句话设计说明（可选）"},
+		},
+		"required": []string{"svg"},
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		raw = []byte(`{"type":"object","properties":{"svg":{"type":"string"}},"required":["svg"]}`)
+	}
+	return llm.ToolSpec{Name: ToolEmitSVG, Description: desc, Parameters: raw}
+}
+
 // toolSpecs 暴露给模型的工具清单。
 func toolSpecs(deps Deps) []llm.ToolSpec {
+	layers := layerToolsEnabled(deps)
 	specs := []llm.ToolSpec{
-		{
-			Name:        ToolEmitSVG,
-			Description: "交付最终 SVG。原样交付，不做任何改写：只在内部校验结构与画布尺寸。这是唯一的交付通道，必须调用。返回校验报告 JSON。",
-			Parameters: json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "svg": {"type": "string", "description": "完整 SVG 源码，含 <svg> 根元素，不要代码块围栏"},
-    "note": {"type": "string", "description": "一句话设计说明（可选）"}
-  },
-  "required": ["svg"]
-}`),
-		},
+		emitSVGSpec(layers),
 		{
 			Name:        ToolValidateSVG,
 			Description: "校验 SVG 结构并返回报告（不修改画布）。用于交付前自检。",
@@ -131,7 +149,7 @@ func toolSpecs(deps Deps) []llm.ToolSpec {
 
 	// 图层工具：生成方式为多图层 + 图层总开关都打开、且工程已就绪时才下发。
 	// 动图模式刻意不下发图层工具——它要的是「一个图层里的会动的画面」。
-	if layerToolsEnabled(deps) {
+	if layers {
 		specs = append(specs, layerToolSpecs()...)
 	}
 	return specs
@@ -143,6 +161,19 @@ func layerToolsEnabled(deps Deps) bool {
 		return false
 	}
 	return config.NormalizeGenMode(deps.Settings).GenMode == config.GenModeLayers
+}
+
+// isDeliveryTool 判断一次成功的工具调用是否构成「交付了内容」。
+//
+// 快速 / 动图模式只有 emit_svg 算交付；多图层模式的交付物是图层，
+// 因此能写入内容的 create_layer / edit_layer 也算（它们只在多图层模式下发）。
+// 只认 emit_svg 会让分层完成的作品被判成「没有交付」，收尾时被当成空回复重试。
+func isDeliveryTool(name string) bool {
+	switch name {
+	case ToolEmitSVG, ToolCreateLayer, ToolEditLayer:
+		return true
+	}
+	return false
 }
 
 // toolOutcome 一次工具执行结果。
@@ -232,6 +263,13 @@ func (e *Engine) toolEmitSVG(raw json.RawMessage) toolOutcome {
 		}
 	}
 
+	// 多图层模式下 emit_svg 只覆盖当前图层：分层交付的主体走 create_layer / edit_layer，
+	// 这条通道留给「整层重画」。这样工具行为与提示词描述保持一致，
+	// 模型即使在多图层模式里图省事调用它，也不会把整幅画面塞进单层。
+	if layerToolsEnabled(e.deps) {
+		return e.emitIntoTargetLayer(text, rep, strings.TrimSpace(in.Note))
+	}
+
 	e.impl.setSVG(text, rep)
 	e.emit(Event{Kind: EvSVG, SVG: text, Text: strings.TrimSpace(in.Note)})
 
@@ -244,6 +282,43 @@ func (e *Engine) toolEmitSVG(raw json.RawMessage) toolOutcome {
 		return toolOutcome{Content: fmt.Sprintf("报告序列化失败：%v", err), IsError: true}
 	}
 	// 自动校验：开启时把校验失败当错误回给模型，逼它按规范重画，而不是带着错误收工。
+	if e.deps.Settings.AutoValidate && !rep.OK {
+		return toolOutcome{
+			Content: string(out) + "\n校验未通过，请修正下列问题后再次调用 emit_svg：" + issueSummary(rep),
+			IsError: true,
+		}
+	}
+	return toolOutcome{Content: string(out)}
+}
+
+// emitIntoTargetLayer 多图层模式下的 emit_svg：把内容写进当前图层，而不是整幅画面。
+//
+// 分工：分层交付靠 create_layer / edit_layer；这条通道只负责「整层重画」。
+// 因此这里不会新建图层、也不会覆盖其它图层，模型即使图省事也塞不进单层整图。
+func (e *Engine) emitIntoTargetLayer(text string, rep svg.Report, note string) toolOutcome {
+	br := e.deps.Layers
+	target := br.Active()
+	if err := br.Write(target, text); err != nil {
+		return toolOutcome{Content: "写入当前图层失败：" + err.Error(), IsError: true}
+	}
+	info, _, err := br.Read(target)
+	if err != nil {
+		return toolOutcome{Content: "读取当前图层失败：" + err.Error(), IsError: true}
+	}
+	rendered := br.Render()
+	e.impl.setSVG(rendered, rep)
+	e.emit(Event{Kind: EvLayers, Layers: layerListOf(br)})
+	e.emit(Event{Kind: EvSVG, SVG: rendered, Text: note})
+
+	out, mErr := json.Marshal(struct {
+		OK    bool      `json:"ok"`
+		Note  string    `json:"note,omitempty"`
+		Layer LayerInfo `json:"layer"`
+		svg.Report
+	}{OK: rep.OK, Note: note, Layer: info, Report: rep})
+	if mErr != nil {
+		return toolOutcome{Content: fmt.Sprintf("报告序列化失败：%v", mErr), IsError: true}
+	}
 	if e.deps.Settings.AutoValidate && !rep.OK {
 		return toolOutcome{
 			Content: string(out) + "\n校验未通过，请修正下列问题后再次调用 emit_svg：" + issueSummary(rep),

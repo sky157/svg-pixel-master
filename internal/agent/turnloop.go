@@ -8,19 +8,39 @@ import (
 	"strings"
 	"time"
 
+	"svg-master/internal/config"
 	"svg-master/internal/llm"
 )
 
 // turn-loop 容错常量（对齐 pi-browser-agent 的 turn-loop 语义）。
 const (
-	maxStreamRetries           = 3                // 单轮模型请求的最大重试次数
-	maxEmptyRetries            = 2                // 空回复重试次数
-	defaultMaxModelSteps       = 40               // 未配置时的模型轮数上限
-	repeatedErrorCallThreshold = 3                // 同一工具连续同错熔断阈值
-	streamWatchdog             = 5 * time.Minute  // 无任何事件的看门狗
-	retryBaseDelay             = 2 * time.Second  // 重试基础退避
-	retryMaxDelay              = 30 * time.Second // 重试最大退避
+	// 单轮模型请求的最大重试次数
+	maxStreamRetries = 3
+	// 空回复重试次数
+	maxEmptyRetries = 2
+	// 未配置时的模型轮数上限
+	defaultMaxModelSteps = config.DefaultMaxSteps
+	// 同一工具连续同错熔断阈值
+	repeatedErrorCallThreshold = 3
+	// 重试基础退避
+	retryBaseDelay = 2 * time.Second
+	// 重试最大退避
+	retryMaxDelay = 30 * time.Second
 )
+
+// streamWatchdogTimeout 无事件看门狗时长：与传输层的「无数据容忍时长」取同一个值。
+// 传输层断开后 Agent 会先看到错误；这里只兜底「连接还在但完全没有事件」的情况。
+// 返回 0 表示不设看门狗。
+func (e *Engine) streamWatchdogTimeout() time.Duration {
+	t := e.deps.Transport
+	if !t.NoTimeout && t.IdleTimeout <= 0 && t.Timeout <= 0 {
+		t = llm.DefaultTransport()
+	}
+	if t.NoTimeout {
+		return 0
+	}
+	return t.IdleTimeout
+}
 
 // streamResult 一次流式调用的累积结果。
 type streamResult struct {
@@ -112,7 +132,7 @@ func (e *Engine) streamOnce(ctx context.Context, req llm.Request) (*streamResult
 	return failure(fmt.Errorf("模型请求连续 %d 次失败：%w", maxStreamRetries+1, lastErr))
 }
 
-// streamAttempt 单次流式请求：带 5 分钟无事件看门狗。
+// streamAttempt 单次流式请求：带「无事件看门狗」（时长跟随传输层的无数据容忍时长）。
 func (e *Engine) streamAttempt(ctx context.Context, req llm.Request) (*streamResult, error) {
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -129,7 +149,33 @@ func (e *Engine) streamAttempt(ctx context.Context, req llm.Request) (*streamRes
 	accs := map[int]*toolCallAcc{}
 	var order []int
 
-	watchdog := time.NewTimer(streamWatchdog)
+	timeout := e.streamWatchdogTimeout()
+	if timeout <= 0 {
+		// 不限时：只等 ctx 结束或事件到来。
+		for {
+			select {
+			case <-ctx.Done():
+				go drain(ch)
+				return res, context.Canceled
+			case ev, ok := <-ch:
+				if !ok {
+					if ctx.Err() != nil {
+						return res, context.Canceled
+					}
+					return finishStream(res, accs, order)
+				}
+				if done, err := e.handleStreamEvent(ev, res, accs, &order); err != nil {
+					go drain(ch)
+					return res, err
+				} else if done {
+					go drain(ch)
+					return finishStream(res, accs, order)
+				}
+			}
+		}
+	}
+
+	watchdog := time.NewTimer(timeout)
 	defer watchdog.Stop()
 	reset := func() {
 		if !watchdog.Stop() {
@@ -138,7 +184,7 @@ func (e *Engine) streamAttempt(ctx context.Context, req llm.Request) (*streamRes
 			default:
 			}
 		}
-		watchdog.Reset(streamWatchdog)
+		watchdog.Reset(timeout)
 	}
 
 	for {
@@ -151,7 +197,7 @@ func (e *Engine) streamAttempt(ctx context.Context, req llm.Request) (*streamRes
 		case <-watchdog.C:
 			cancel()
 			go drain(ch)
-			return res, fmt.Errorf("模型响应超过 %s 没有任何事件，已中止本次请求", streamWatchdog)
+			return res, fmt.Errorf("模型响应超过 %s 没有任何事件，已中止本次请求", timeout)
 
 		case ev, ok := <-ch:
 			if !ok {

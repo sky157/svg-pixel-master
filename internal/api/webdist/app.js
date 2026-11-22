@@ -580,7 +580,8 @@
     if (!st) return;
     renderThinkingOptions();
     setSelValue('thinkingSel', st.thinking || 'off');
-    $('maxSteps').value = st.agent?.maxSteps || 40;
+    $('maxSteps').value = st.agent?.maxSteps || 80;
+    $('timeoutSec').value = st.agent?.timeoutSec || 600;
     $('autoValidate').checked = !!st.agent?.autoValidate;
     $('compressOn').checked = !!st.agent?.compressOn;
     $('streamOff').checked = !!st.agent?.streamDisabled;
@@ -811,7 +812,8 @@
     st.thinking = selValue('thinkingSel') || st.thinking;
     st.fastMode = $('fastMode').checked;
     if (st.agent) {
-      st.agent.maxSteps = clamp(parseInt($('maxSteps').value, 10) || st.agent.maxSteps || 40, 1, 200);
+      st.agent.maxSteps = clamp(parseInt($('maxSteps').value, 10) || st.agent.maxSteps || 80, 1, 200);
+      st.agent.timeoutSec = normalizeTimeoutSec($('timeoutSec').value);
       st.agent.autoValidate = $('autoValidate').checked;
       st.agent.compressOn = $('compressOn').checked;
       st.agent.streamDisabled = $('streamOff').checked;
@@ -827,10 +829,24 @@
   }
 
   // ── 左栏输入绑定（连接信息已全部移入供应商弹窗） ──────────
+  // normalizeTimeoutSec 与后端 config.NormalizeTimeoutSec 同一规则：
+  // 30–3600 秒原样；-1 表示不限时；其它脏值回落到 600。
+  function normalizeTimeoutSec(v) {
+    const n = parseInt(v, 10);
+    if (n === -1) return -1;
+    if (Number.isFinite(n) && n >= 30 && n <= 3600) return n;
+    return 600;
+  }
   $('maxSteps').addEventListener('change', () => {
     if (!S.settings) return;
-    S.settings.agent.maxSteps = clamp(parseInt($('maxSteps').value, 10) || 40, 1, 200);
+    S.settings.agent.maxSteps = clamp(parseInt($('maxSteps').value, 10) || 80, 1, 200);
     $('maxSteps').value = S.settings.agent.maxSteps;
+    persist();
+  });
+  $('timeoutSec').addEventListener('change', () => {
+    if (!S.settings) return;
+    S.settings.agent.timeoutSec = normalizeTimeoutSec($('timeoutSec').value);
+    $('timeoutSec').value = S.settings.agent.timeoutSec;
     persist();
   });
   $('autoValidate').addEventListener('change', () => {

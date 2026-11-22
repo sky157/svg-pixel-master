@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"svg-master/internal/config"
 )
 
 // 角色常量。
@@ -164,17 +166,35 @@ type Transport struct {
 	MaxRetries    int
 	RetryBase     time.Duration
 	MaxRetryDelay time.Duration
+	// NoTimeout 关闭首字节超时与空闲超时：连接不断就一直等，只能手动停止。
+	NoTimeout bool
 }
 
 // DefaultTransport 默认传输参数（对齐 pi-browser-agent 的 turn-loop 常量）。
 func DefaultTransport() Transport {
 	return Transport{
-		Timeout:       120 * time.Second,
-		IdleTimeout:   300 * time.Second,
+		Timeout:       time.Duration(config.DefaultTimeoutSec) * time.Second,
+		IdleTimeout:   time.Duration(config.DefaultTimeoutSec) * time.Second,
 		MaxRetries:    3,
 		RetryBase:     2 * time.Second,
 		MaxRetryDelay: 30 * time.Second,
 	}
+}
+
+// TransportForTimeout 按用户设置的「无数据容忍秒数」构造传输参数。
+//
+// 该值是空闲阈值而不是总时长：只要连接还在吐数据就不会被打断，
+// 因此长 SVG 生成与长思考不会因为总时长超时被掐断。
+func TransportForTimeout(sec int) Transport {
+	sec = config.NormalizeTimeoutSec(sec)
+	t := DefaultTransport()
+	if sec == config.TimeoutSecNoLimit {
+		t.NoTimeout = true
+		return t
+	}
+	t.Timeout = time.Duration(sec) * time.Second
+	t.IdleTimeout = time.Duration(sec) * time.Second
+	return t
 }
 
 // NewClient 见 client.go（工厂 + 未知协议兜底）。

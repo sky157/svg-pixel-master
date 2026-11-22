@@ -233,6 +233,10 @@
             <label class="fld"><span>最大步数</span>
               <input id="maxSteps" type="number" min="1" max="200" step="1" />
             </label>
+            <label class="fld"><span>无响应超时（秒）</span>
+              <input id="timeoutSec" type="number" min="-1" max="3600" step="30" />
+              <small class="muted">只计算「多久没有收到任何数据」，连接一直在输出就不会中断；填 -1 表示不限时。</small>
+            </label>
             <label class="check"><input type="checkbox" id="autoValidate" /><span>自动校验</span></label>
             <label class="check"><input type="checkbox" id="compressOn" /><span>上下文压缩</span></label>
             <label class="check"><input type="checkbox" id="streamOff" /><span>非流式兜底</span></label>

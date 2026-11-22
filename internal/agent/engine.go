@@ -239,23 +239,27 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 		model = e.deps.Model
 	}
 
+	// 生成方式：三档开关的唯一真源是 Settings.GenMode（旧配置会按 MultiStep 推断）。
+	//   quick  → 一次性交付整幅 SVG，不注入分步引导；
+	//   layers → 分步、按图层交付（有图层工具时连输出规范一起换成分层版）；
+	//   anim   → 仍是单图层，但要求交付可播放的动图。
+	mode := config.NormalizeGenMode(e.deps.Settings).GenMode
+	layerTools := layerToolsEnabled(e.deps)
+
 	system := buildSystemPrompt(canvas)
+	if mode == config.GenModeLayers && layerTools {
+		// 有图层工具却下发「唯一通道是 emit_svg 一次给全」时，模型多半直接一次性整图，
+		// 多图层模式就退化成单图层。这里把输出规范整体换成分层版，约束才和工具一致。
+		system = buildLayersSystemPrompt(canvas)
+	}
 	if extra := strings.TrimSpace(t.System); extra != "" {
 		system += "\n\n" + extra
 	}
-
-	// 生成方式：三档开关的唯一真源是 Settings.GenMode（旧配置会按 MultiStep 推断）。
-	//   quick  → 一次性交付整幅 SVG，不注入分步引导；
-	//   layers → 注入分步引导 + 图层工作区约定（下发图层工具时）；
-	//   anim   → 仍是单图层，但要求交付可播放的动图。
-	mode := config.NormalizeGenMode(e.deps.Settings).GenMode
-	switch mode {
-	case config.GenModeLayers:
+	if mode == config.GenModeLayers && layerTools {
 		system += "\n\n" + multiStepNote
-		if e.deps.LayerTools {
-			system += "\n\n" + layerToolsNote()
-		}
-	case config.GenModeAnim:
+		system += "\n\n" + layerToolsNote()
+	}
+	if mode == config.GenModeAnim {
 		system += "\n\n" + animatedNote()
 	}
 	// 用户清空过上下文：提醒它先读图层再动手，而不是假设画布是空的。
@@ -270,10 +274,7 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 		msgs = append(append([]llm.Message{}, t.History...), msgs...)
 	}
 
-	maxSteps := e.deps.Settings.MaxSteps
-	if maxSteps <= 0 {
-		maxSteps = defaultMaxModelSteps
-	}
+	maxSteps := config.NormalizeMaxSteps(e.deps.Settings.MaxSteps)
 	specs := toolSpecs(e.deps)
 	comp := e.impl.compressor()
 
@@ -416,7 +417,7 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 				out.ToolErrors++
 				e.emit(Event{Kind: EvToolEnd, CallID: call.ID, Tool: call.Name, Error: oc.Content})
 			} else {
-				if call.Name == ToolEmitSVG {
+				if isDeliveryTool(call.Name) {
 					deliveryOK = true
 				}
 				e.emit(Event{Kind: EvToolEnd, CallID: call.ID, Tool: call.Name, Result: oc.Content})

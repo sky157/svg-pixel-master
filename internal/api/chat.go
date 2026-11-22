@@ -98,7 +98,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := llm.NewClient(prov.Protocol, llm.NormalizeBaseURL(prov.Protocol, prov.BaseURL), prov.APIKey, llm.DefaultTransport())
+	// 超时按用户设置传入：它是「无数据容忍时长」，不是总时长，
+	// 因此长 SVG 生成不会被总时长掐断。
+	transport := llm.TransportForTimeout(st.Agent.TimeoutSec)
+	client := llm.NewClient(prov.Protocol, llm.NormalizeBaseURL(prov.Protocol, prov.BaseURL), prov.APIKey, transport)
 	fast := st.FastMode
 	if in.FastMode != nil {
 		fast = *in.FastMode
@@ -203,7 +206,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		MaxTokens:        caps.MaxTokens,
 		Thinking:         thinking,
 		ServiceTier:      serviceTier,
-		Transport:        llm.DefaultTransport(),
+		Transport:        transport,
 		Emit:             emit,
 		Layers:           s.projectBridge(),
 		LayerTools:       layerTools,

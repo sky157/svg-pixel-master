@@ -279,12 +279,11 @@ func Normalize(in Settings, prev Settings) (Settings, error) {
 	default:
 		out.Thinking = "off"
 	}
-	if out.Agent.MaxSteps <= 0 || out.Agent.MaxSteps > 200 {
-		out.Agent.MaxSteps = 40
-	}
+	out.Agent.MaxSteps = NormalizeMaxSteps(out.Agent.MaxSteps)
 	if out.Agent.CompressAt <= 0 || out.Agent.CompressAt > 95 {
 		out.Agent.CompressAt = 75
 	}
+	out.Agent.TimeoutSec = NormalizeTimeoutSec(out.Agent.TimeoutSec)
 	// 生成方式：合法值原样保留，空/非法值归一，并同步派生的 MultiStep。
 	out.Agent = NormalizeGenMode(out.Agent)
 	if out.Layers.PanelHeight < 120 || out.Layers.PanelHeight > 900 {
