@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"svg-master/internal/codex"
 	"svg-master/internal/config"
@@ -22,16 +23,17 @@ var webFS embed.FS
 
 // Server 本地 HTTP 服务。
 type Server struct {
-	codex     *codex.Manager
-	store     *config.Store
-	token     string
-	ln        net.Listener
-	srv       *http.Server
-	mu        sync.Mutex
-	engines   map[string]*engineHandle // session -> 正在运行的任务
-	resetting bool
-	proj      projectState // 当前打开的工程（单例）
-	desktop   bool         // 内置窗口模式：可以调系统文件夹选择器
+	codex        *codex.Manager
+	store        *config.Store
+	token        string
+	ln           net.Listener
+	srv          *http.Server
+	mu           sync.Mutex
+	engines      map[string]*engineHandle // session -> 正在运行的任务
+	resetting    bool
+	pixelStopped map[string]time.Time
+	proj         projectState // 当前打开的工程（单例）
+	desktop      bool         // 内置窗口模式：可以调系统文件夹选择器
 }
 
 // engineHandle 一个运行中的任务句柄（具体类型由 api 内部使用）。
@@ -48,10 +50,11 @@ func New(store *config.Store, port int) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		codex:   codex.New(store.Dir()),
-		store:   store,
-		token:   hex.EncodeToString(tok),
-		engines: map[string]*engineHandle{},
+		codex:        codex.New(store.Dir()),
+		store:        store,
+		token:        hex.EncodeToString(tok),
+		engines:      map[string]*engineHandle{},
+		pixelStopped: make(map[string]time.Time),
 	}
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
@@ -142,6 +145,13 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/project/close", s.handleProjectClose)
 	mux.HandleFunc("/api/layers", s.handleLayers)
 	mux.HandleFunc("/api/layers/ops", s.handleLayerOps)
+	mux.HandleFunc("/api/pixel/layer", s.handlePixelLayer)
+	mux.HandleFunc("/api/pixel/resize", s.handlePixelResize)
+	mux.HandleFunc("/api/pixel/quantize", s.handlePixelQuantize)
+	mux.HandleFunc("/api/pixel/palette", s.handlePixelPalette)
+	mux.HandleFunc("/api/pixel/assets", s.handlePixelAssets)
+	mux.HandleFunc("/api/pixel/checkpoint", s.handlePixelCheckpoint)
+	mux.HandleFunc("/api/pixel/export", s.handlePixelExport)
 
 	return withAuth(s, mux)
 }

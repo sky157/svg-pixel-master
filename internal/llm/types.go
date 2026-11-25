@@ -34,6 +34,15 @@ type ImageData struct {
 	Data string `json:"data"`
 }
 
+// DataURL returns the inline image URL used by OpenAI and Codex clients.
+func (img ImageData) DataURL() string {
+	mime := img.MIME
+	if mime == "" {
+		mime = "image/png"
+	}
+	return "data:" + mime + ";base64," + img.Data
+}
+
 // ToolCall 模型发起的一次工具调用。
 type ToolCall struct {
 	ID        string          `json:"id"`
@@ -138,14 +147,16 @@ type StreamEvent struct {
 
 // Request 一次模型请求（已与协议无关）。
 type Request struct {
-	System      string
-	Messages    []Message
-	Tools       []ToolSpec
-	Model       string
-	MaxTokens   int
-	Thinking    string // off|low|medium|high|xhigh|max
-	ServiceTier string // "priority" requests Fast; empty preserves the provider default.
-	Stream      bool
+	System           string
+	Messages         []Message
+	Tools            []ToolSpec
+	Model            string
+	MaxTokens        int
+	Thinking         string // off|low|medium|high|xhigh|max
+	ServiceTier      string // "priority" requests Fast; empty preserves the provider default.
+	Stream           bool
+	Pixel            bool // Selects the drawing instructions for a Codex dynamic-tool thread.
+	PixelAssetPrefix bool // Messages[0] holds current project assets when set.
 	// SessionID 用于网关前缀缓存亲和（session_id / x-client-request-id / x-session-affinity）
 	SessionID string
 }

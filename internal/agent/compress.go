@@ -60,11 +60,21 @@ type state struct {
 
 // compressor Compressor 的默认实现。
 type compressor struct {
-	mu         sync.Mutex
-	window     int // 上下文窗口
-	compressAt int // 触发阈值百分比
-	st         state
-	refs       []string // 消息索引 -> ref
+	mu               sync.Mutex
+	window           int // 上下文窗口
+	compressAt       int // 触发阈值百分比
+	st               state
+	refs             []string // 消息索引 -> ref
+	pixelUserRef     int      // Current pixel user message's one-based index; 0 in SVG runs.
+	pixelAssetTokens int      // Request prefix tokens outside the numbered conversation.
+	pairedMessages   map[int]int
+}
+
+func (c *compressor) protectPixelTurn(currentUser, assetTokens int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pixelUserRef = currentUser + 1
+	c.pixelAssetTokens = assetTokens
 }
 
 // newCompressor 构造压缩内核；窗口过小时返回 nil（调用方需判空）。
@@ -141,13 +151,16 @@ func msgTokens(m llm.Message) int {
 		case llm.BlockToolResult:
 			if b.ToolResult != nil {
 				n += 6 + estTokens(b.ToolResult.Content)
+				n += imageTokenEstimate * len(b.ToolResult.Images)
 			}
 		case llm.BlockImage:
-			n += 800
+			n += imageTokenEstimate
 		}
 	}
 	return n
 }
+
+const imageTokenEstimate = 800
 
 // estTokensAll 一组消息的 token 估算。
 func estTokensAll(msgs []llm.Message) int {
@@ -166,13 +179,22 @@ func (c *compressor) Project(msgs []llm.Message, tokenCount int) ([]llm.Message,
 	defer c.mu.Unlock()
 
 	c.assignRefs(len(msgs))
+	if c.pixelUserRef > 0 {
+		c.pairedMessages = make(map[int]int)
+		for i := 1; i < len(msgs); i++ {
+			if msgs[i-1].Role == llm.RoleAssistant && msgs[i].Role == llm.RoleTool {
+				c.pairedMessages[i-1] = i
+				c.pairedMessages[i] = i - 1
+			}
+		}
+	}
 	c.sync(len(msgs))
 	c.merge()
 	c.prune()
 
 	pressure := tokenCount
 	if pressure <= 0 {
-		pressure = estTokensAll(msgs)
+		pressure = estTokensAll(msgs) + c.pixelAssetTokens
 	}
 
 	// emergencyTruncate：极端占用时强制折叠最老消息。
@@ -184,7 +206,7 @@ func (c *compressor) Project(msgs []llm.Message, tokenCount int) ([]llm.Message,
 
 	// nudge：以「真实请求大小」为准，压缩过就用投影后的值。
 	if folded {
-		pressure = estTokensAll(out)
+		pressure = estTokensAll(out) + c.pixelAssetTokens
 	}
 	if c.window > 0 && pressure*100 >= c.window*c.compressAt {
 		c.st.nudge = fmt.Sprintf(
@@ -466,6 +488,16 @@ func (c *compressor) Compress(ranges []CompressRange) (int, int, []string, error
 		if start > end {
 			start, end = end, start
 		}
+		if peer, ok := c.pairedMessages[start]; ok && peer < start {
+			start = peer
+		}
+		if peer, ok := c.pairedMessages[end]; ok && peer > end {
+			end = peer
+		}
+		if protected := c.pixelUserRef - 1; start <= protected && protected <= end {
+			warnings = append(warnings, "当前用户指令及附件须保留，已跳过覆盖它的压缩区间")
+			continue
+		}
 		if strings.TrimSpace(r.Summary) == "" {
 			warnings = append(warnings, fmt.Sprintf("%s～%s 缺少 summary，已跳过", r.StartRef, r.EndRef))
 			continue
@@ -633,7 +665,7 @@ func (c *compressor) emergencyTruncate(n, pressure int) bool {
 	// 找一段连续的可见消息（保留最后 4 条）。
 	start := -1
 	for i := 0; i < n-4; i++ {
-		if !hidden[i] {
+		if !hidden[i] && i+1 != c.pixelUserRef {
 			start = i
 			break
 		}
@@ -642,8 +674,14 @@ func (c *compressor) emergencyTruncate(n, pressure int) bool {
 		return false
 	}
 	end := start
-	for end+1 < n-4 && !hidden[end+1] && end-start < 30 {
+	for end+1 < n-4 && !hidden[end+1] && end+2 != c.pixelUserRef && end-start < 30 {
 		end++
+	}
+	if peer, ok := c.pairedMessages[end]; ok && peer > end {
+		end--
+	}
+	if end < start {
+		return false
 	}
 	refs := make([]string, 0, end-start+1)
 	for i := start; i <= end; i++ {

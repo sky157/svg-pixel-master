@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -246,29 +247,69 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 	mode := config.NormalizeGenMode(e.deps.Settings).GenMode
 	layerTools := layerToolsEnabled(e.deps)
 
-	system := buildSystemPrompt(canvas)
-	if mode == config.GenModeLayers && layerTools {
-		// 有图层工具却下发「唯一通道是 emit_svg 一次给全」时，模型多半直接一次性整图，
-		// 多图层模式就退化成单图层。这里把输出规范整体换成分层版，约束才和工具一致。
-		system = buildLayersSystemPrompt(canvas)
+	pixelMode := e.deps.Pixel != nil
+	var system string
+	var msgs []llm.Message
+	var pixelInput PixelInput
+	var assetPrefix []llm.Message
+	var assetBytes, assetTokens int
+	if pixelMode {
+		info := e.deps.Pixel.CanvasInfo()
+		if t.Pixel != nil {
+			pixelInput = *t.Pixel
+		}
+		if pixelInput.Selection == nil {
+			pixelInput.Selection = info.Selection
+		}
+		if pixelInput.RestrictToSelection && pixelInput.Selection == nil {
+			e.saveHistory(t.History)
+			return Stats{}, errors.New("请先在像素画布上创建选区")
+		}
+		system = pixelSystemPrompt(e.deps.Vision)
+		if extra := strings.TrimSpace(t.System); extra != "" {
+			system += "\n\n" + extra
+		}
+		assets, err := e.pixelAssetMessage(pixelInput)
+		if err != nil {
+			e.saveHistory(t.History)
+			return Stats{}, err
+		}
+		if len(assets.Blocks) > 0 {
+			assetPrefix = []llm.Message{assets}
+			assetBytes = pixelUserImageBytes(assets)
+			assetTokens = msgTokens(assets)
+		}
+		user, err := e.pixelUserMessage(t.Prompt, pixelInput, info)
+		if err != nil {
+			e.saveHistory(t.History)
+			return Stats{}, err
+		}
+		if assetBytes+pixelUserImageBytes(user) > maxPixelInputImageBytes {
+			e.saveHistory(t.History)
+			return Stats{}, errors.New("主图、参考图和画布快照总大小超出模型请求预算，请缩小或减少图片")
+		}
+		msgs = []llm.Message{user}
+	} else {
+		system = buildSystemPrompt(canvas)
+		if mode == config.GenModeLayers && layerTools {
+			// Match the delivery contract to the available SVG layer tools.
+			system = buildLayersSystemPrompt(canvas)
+		}
+		if extra := strings.TrimSpace(t.System); extra != "" {
+			system += "\n\n" + extra
+		}
+		if mode == config.GenModeLayers && layerTools {
+			system += "\n\n" + multiStepNote
+			system += "\n\n" + layerToolsNote()
+		}
+		if mode == config.GenModeAnim {
+			system += "\n\n" + animatedNote()
+		}
+		if e.deps.ContextClearedAt > 0 && e.deps.LayerTools {
+			system += "\n\n" + contextClearedNote()
+		}
+		msgs = buildInitialMessages(t)
 	}
-	if extra := strings.TrimSpace(t.System); extra != "" {
-		system += "\n\n" + extra
-	}
-	if mode == config.GenModeLayers && layerTools {
-		system += "\n\n" + multiStepNote
-		system += "\n\n" + layerToolsNote()
-	}
-	if mode == config.GenModeAnim {
-		system += "\n\n" + animatedNote()
-	}
-	// 用户清空过上下文：提醒它先读图层再动手，而不是假设画布是空的。
-	// 动图模式没有图层工具，这条提醒会误导模型，因此跳过。
-	if e.deps.ContextClearedAt > 0 && e.deps.LayerTools {
-		system += "\n\n" + contextClearedNote()
-	}
-
-	msgs := buildInitialMessages(t)
 	// 连续对话：把上一轮结束时的完整历史拼在本次输入之前（浅拷贝，运行期只 append）。
 	if len(t.History) > 0 {
 		msgs = append(append([]llm.Message{}, t.History...), msgs...)
@@ -277,11 +318,22 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 	maxSteps := config.NormalizeMaxSteps(e.deps.Settings.MaxSteps)
 	specs := toolSpecs(e.deps)
 	comp := e.impl.compressor()
+	currentUser := len(t.History)
+	keepToolImages := 0
+	if pixelMode {
+		if c, ok := comp.(*compressor); ok {
+			c.protectPixelTurn(currentUser, assetTokens)
+		}
+		if e.deps.Vision {
+			keepToolImages = maxRecentPixelToolImages
+		}
+	}
 
 	var out Stats
 	modelSteps, emptyRetry := 0, 0
 	deliveryOK := false
 	completed := false
+	pixelChanged, pixelInspected := false, false
 	breaker := newBreaker()
 
 	for modelSteps < maxSteps {
@@ -292,13 +344,22 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 		}
 
 		// 每次请求前投影上下文（只折叠投影，不动原始 msgs）。
-		used := estTokensAll(msgs)
 		projected, nudge := msgs, ""
+		if pixelMode {
+			projected = projectPixelImages(msgs, currentUser, keepToolImages, assetBytes)
+		}
+		used := estTokensAll(projected) + assetTokens
 		if comp != nil {
-			projected, nudge = comp.Project(msgs, used)
+			projected, nudge = comp.Project(projected, used)
+			if pixelMode {
+				used = estTokensAll(projected) + assetTokens
+			}
 			if nudge != "" {
 				e.emit(Event{Kind: EvNudge, Text: nudge})
 			}
+		}
+		if len(assetPrefix) > 0 {
+			projected = slices.Concat(assetPrefix, projected)
 		}
 		st.mu.Lock()
 		st.used = used
@@ -306,15 +367,17 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 		st.mu.Unlock()
 
 		req := llm.Request{
-			System:      system,
-			Messages:    projected,
-			Tools:       specs,
-			Model:       model,
-			MaxTokens:   e.deps.MaxTokens,
-			Thinking:    e.deps.Thinking,
-			ServiceTier: e.deps.ServiceTier,
-			Stream:      !e.deps.Settings.StreamDisabled,
-			SessionID:   t.Session,
+			System:           system,
+			Messages:         projected,
+			Tools:            specs,
+			Model:            model,
+			MaxTokens:        e.deps.MaxTokens,
+			Thinking:         e.deps.Thinking,
+			ServiceTier:      e.deps.ServiceTier,
+			Stream:           !e.deps.Settings.StreamDisabled,
+			Pixel:            pixelMode,
+			PixelAssetPrefix: len(assetPrefix) > 0,
+			SessionID:        t.Session,
 		}
 
 		res, err := e.streamOnce(runCtx, req)
@@ -349,7 +412,11 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 				if assistant.NativeOutput != nil {
 					msgs = append(msgs, assistant)
 				}
-				e.logf("info", "SVG 已交付，模型结束回复")
+				if pixelMode {
+					e.logf("info", "像素画已写入工程，模型结束回复")
+				} else {
+					e.logf("info", "SVG 已交付，模型结束回复")
+				}
 				completed = true
 				break
 			}
@@ -384,7 +451,7 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 			if err := runCtx.Err(); err != nil {
 				// 保持调用/结果配对，防止停止后继续会话触发缺少工具结果的协议错误。
 				for _, pending := range res.toolCalls[i:] {
-					toolMsg.Blocks = append(toolMsg.Blocks, toolResultBlock(pending, "用户已中止，此工具未执行", true))
+					toolMsg.Blocks = append(toolMsg.Blocks, toolResultBlock(pending, toolOutcome{Content: "用户已中止，此工具未执行", IsError: true}))
 				}
 				msgs = append(msgs, toolMsg)
 				e.saveHistory(msgs)
@@ -401,7 +468,7 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 				content := fmt.Sprintf("工具 %s 已连续 %d 次报相同错误，本次调用被熔断。请换一种方式，或直接给出可用的结果。", call.Name, repeatedErrorCallThreshold)
 				e.emit(Event{Kind: EvToolEnd, CallID: call.ID, Tool: call.Name, Error: content})
 				e.logf("warn", "%s", content)
-				toolMsg.Blocks = append(toolMsg.Blocks, toolResultBlock(call, content, true))
+				toolMsg.Blocks = append(toolMsg.Blocks, toolResultBlock(call, toolOutcome{Content: content, IsError: true}))
 				if hint != "" {
 					toolMsg.Blocks = append(toolMsg.Blocks, llm.Block{
 						Type: llm.BlockText,
@@ -411,19 +478,25 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 				continue
 			}
 
-			oc := e.runTool(runCtx, call)
+			oc := e.runTool(runCtx, call, pixelInput)
 			if oc.IsError {
 				deliveryOK = false
 				out.ToolErrors++
 				e.emit(Event{Kind: EvToolEnd, CallID: call.ID, Tool: call.Name, Error: oc.Content})
 			} else {
-				if isDeliveryTool(call.Name) {
+				if oc.PixelChanged {
+					pixelChanged = true
+				}
+				if pixelChanged && call.Name == ToolPixelInspect {
+					pixelInspected = true
+				}
+				if isDeliveryTool(call.Name) || oc.PixelChanged {
 					deliveryOK = true
 				}
 				e.emit(Event{Kind: EvToolEnd, CallID: call.ID, Tool: call.Name, Result: oc.Content})
 			}
 			breaker.record(call, oc)
-			toolMsg.Blocks = append(toolMsg.Blocks, toolResultBlock(call, oc.Content, oc.IsError))
+			toolMsg.Blocks = append(toolMsg.Blocks, toolResultBlock(call, oc))
 		}
 		if len(toolMsg.Blocks) > 0 {
 			msgs = append(msgs, toolMsg)
@@ -431,7 +504,9 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 	}
 
 	st.mu.Lock()
-	st.used = estTokensAll(msgs)
+	if !pixelMode {
+		st.used = estTokensAll(msgs)
+	}
 	st.msgs = len(msgs)
 	st.mu.Unlock()
 	e.saveHistory(msgs)
@@ -439,6 +514,9 @@ func (e *Engine) run(ctx context.Context, t Task) (Stats, error) {
 	e.finishStats(&out, start)
 	if !completed && modelSteps >= maxSteps {
 		return out, fmt.Errorf("已达模型轮数上限（%d），任务尚未完成，当前作品已保留", maxSteps)
+	}
+	if pixelChanged && !pixelInspected {
+		return out, errors.New("本轮像素改动已保存，模型结束前未完成自检")
 	}
 	return out, nil
 }
@@ -448,8 +526,12 @@ func (e *Engine) saveHistory(msgs []llm.Message) {
 	if e == nil || e.impl.st == nil {
 		return
 	}
-	snapshot := make([]llm.Message, len(msgs))
-	copy(snapshot, msgs)
+	var snapshot []llm.Message
+	if e.deps.Pixel != nil {
+		snapshot = projectPixelImages(msgs, -1, maxRecentPixelToolImages, 0)
+	} else {
+		snapshot = append([]llm.Message(nil), msgs...)
+	}
 	e.impl.st.mu.Lock()
 	e.impl.st.history = snapshot
 	e.impl.st.mu.Unlock()
@@ -544,14 +626,15 @@ func buildAssistantMessage(res *streamResult) llm.Message {
 }
 
 // toolResultBlock 构造工具结果块。
-func toolResultBlock(call llm.ToolCall, content string, isErr bool) llm.Block {
+func toolResultBlock(call llm.ToolCall, result toolOutcome) llm.Block {
 	return llm.Block{
 		Type: llm.BlockToolResult,
 		ToolResult: &llm.ToolResult{
 			CallID:  call.ID,
 			Name:    call.Name,
-			Content: content,
-			IsError: isErr,
+			Content: result.Content,
+			IsError: result.IsError,
+			Images:  result.Images,
 		},
 	}
 }

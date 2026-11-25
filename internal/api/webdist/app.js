@@ -304,14 +304,31 @@
   });
 
   // ── 顶栏标签页（预览 / 代码 / 日志流） ──────────────────
-  const TAB_OF = { paneGen: 'gen', paneCode: 'code', paneStream: 'stream' };
+  let workspace = 'svg';
+  let switchingWorkspace = false;
+  let preparingPixelRun = false;
+  let pixelStop = null;
+  const workspacePrompts = { svg: '', pixel: '' };
+  const isPixel = () => workspace === 'pixel';
+  const projectEngine = (pj = S.project) => pj?.engine || 'svg';
+  const hasWorkspaceProject = () => S.project?.open && projectEngine() === workspace;
+  const pixel = window.createPixelStudio?.({
+    api, toast, applyProject, isActive: isPixel, openProject: () => openProjectModal(), token: TOKEN,
+  });
+  if (!pixel) {
+    $('workspacePixel').classList.add('hidden');
+    $('projectWorkspacePixel').classList.add('hidden');
+  }
+  const TAB_OF = { paneGen: 'gen', panePixel: 'gen', paneCode: 'code', paneStream: 'stream' };
   function showPane(id) {
-    ['paneGen', 'paneCode', 'paneStream'].forEach((p) => $(p).classList.toggle('hidden', p !== id));
+    if (isPixel() && id !== 'paneStream') id = 'panePixel';
+    ['paneGen', 'panePixel', 'paneCode', 'paneStream'].forEach((p) => $(p).classList.toggle('hidden', p !== id));
     const tab = TAB_OF[id] || 'gen';
     document.querySelectorAll('#tabs .tab').forEach((x) => x.classList.toggle('active', x.dataset.tab === tab));
     S.codeOpen = id === 'paneCode';
     if (id === 'paneCode') renderCode();
     else if (id === 'paneGen') requestAnimationFrame(recomputeFit);
+    else if (id === 'panePixel') requestAnimationFrame(() => pixel?.layout());
   }
   function setCodeView(on) { showPane(on ? 'paneCode' : 'paneGen'); }
   $('tabs').addEventListener('click', (e) => {
@@ -322,6 +339,58 @@
     else if (tab === 'stream') showPane('paneStream');
     else showPane('paneGen');
   });
+
+  function showWorkspace(engine) {
+    const next = engine === 'pixel' && pixel ? 'pixel' : 'svg';
+    if (next !== workspace) {
+      workspacePrompts[workspace] = $('prompt').value;
+      workspace = next;
+      $('prompt').value = workspacePrompts[next];
+    }
+    document.documentElement.dataset.workspace = workspace;
+    for (const [id, active] of [
+      ['workspaceSVG', !isPixel()], ['workspacePixel', isPixel()],
+      ['projectWorkspaceSVG', !isPixel()], ['projectWorkspacePixel', isPixel()],
+    ]) {
+      $(id).classList.toggle('active', active);
+      $(id).setAttribute('aria-pressed', String(active));
+    }
+    const genTab = document.querySelector('#tabs [data-tab="gen"]');
+    genTab.textContent = isPixel() ? '画板' : '预览';
+    $('prompt').placeholder = isPixel()
+      ? '描述要画什么，也可以指定主图构图或参考图 #1 的角色…' : '描述你要生成的 SVG…';
+    showPane('paneGen');
+    renderLayers();
+    updateProjectBadge();
+  }
+
+  async function switchWorkspace(engine) {
+    if (engine === workspace || switchingWorkspace) return;
+    if (S.running || preparingPixelRun || S.clearing || pixel?.actionBusy) {
+      toast('请先结束当前任务', true);
+      return;
+    }
+    switchingWorkspace = true;
+    try {
+      if (isPixel() && hasWorkspaceProject()) await pixel.flush();
+      showWorkspace(engine);
+      if (S.settings) {
+        S.settings.workspace = workspace;
+        persist();
+      }
+      if (!hasWorkspaceProject() || !$('modalProject').classList.contains('hidden')) {
+        openProjectModal({ boot: bootPickOpen });
+      }
+    } catch (error) {
+      toast('当前工程未同步：' + error.message, true);
+    } finally {
+      switchingWorkspace = false;
+    }
+  }
+  $('workspaceSVG').addEventListener('click', () => switchWorkspace('svg'));
+  $('workspacePixel').addEventListener('click', () => switchWorkspace('pixel'));
+  $('projectWorkspaceSVG').addEventListener('click', () => switchWorkspace('svg'));
+  $('projectWorkspacePixel').addEventListener('click', () => switchWorkspace('pixel'));
 
   // ── 左栏折叠 ────────────────────────────────────────────
   $('leftToggle').addEventListener('click', () => {
@@ -392,6 +461,7 @@
     try {
       const st = await api('/api/state');
       S.settings = st.settings;
+      showWorkspace(S.settings?.workspace);
       S.protocols = st.protocols || [];
       S.canvases = st.canvases || [];
       S.prompts = st.prompts || [];
@@ -976,6 +1046,7 @@
     handleFiles(Array.from(e.dataTransfer?.files || []));
   });
   document.addEventListener('paste', (e) => {
+    if (isPixel()) { pixel.paste(e); return; }
     const items = Array.from(e.clipboardData?.items || []);
     const files = items.filter((i) => i.kind === 'file').map((i) => i.getAsFile()).filter(Boolean);
     if (files.length) { e.preventDefault(); handleFiles(files); }
@@ -1774,11 +1845,11 @@
         break;
       }
       case 'svg': {
-        if (ev.svg) setSVG(ev.svg, 'stream');
+        if (!isPixel() && ev.svg) setSVG(ev.svg, 'stream');
         break;
       }
       case 'tool_delta': {
-        if (ev.text) setSVGPreview(ev.text);
+        if (!isPixel() && ev.text) setSVGPreview(ev.text);
         break;
       }
       case 'canvas': {
@@ -1792,7 +1863,8 @@
         break;
       }
       case 'tool_start': toolStart(ev); break;
-      case 'layers': if (Array.isArray(ev.layers)) { S.project = S.project || {}; S.project.layers = ev.layers; renderLayers(); } break;
+      case 'pixel_update': if (isPixel()) pixel.handleUpdate(ev.pixel || ev.pixelUpdate); break;
+      case 'layers': if (!isPixel() && Array.isArray(ev.layers)) { S.project = S.project || {}; S.project.layers = ev.layers; renderLayers(); } break;
       case 'tool_end': toolEnd(ev); break;
       case 'usage': updateUsage(ev.usage); break;
       case 'service_tier':
@@ -1807,8 +1879,12 @@
       case 'done': {
         updateUsage(ev.usage);
         if (ev.session) S.session = ev.session; // 对话历史跟着工程走，记住会话 id
-        refreshProject(); // 模型可能改了图层文件，重读一次
-        finishRun('DONE', '任务完成' + (ev.usage ? ` · ${ev.usage.modelSteps} 轮 / ${ev.usage.toolCalls} 工具 / ${(ev.usage.elapsedMs / 1000).toFixed(1)}s` : ''));
+        const note = '任务完成' + (ev.usage ? ` · ${ev.usage.modelSteps} 轮 / ${ev.usage.toolCalls} 工具 / ${(ev.usage.elapsedMs / 1000).toFixed(1)}s` : '');
+        if (isPixel()) S.pixelTerminal = { level: 'DONE', note };
+        else {
+          refreshProject(); // 模型可能改了图层文件，重读一次
+          finishRun('DONE', note);
+        }
         break;
       }
       case 'error': {
@@ -1816,7 +1892,8 @@
         const msg = ev.error || ev.text || '未知错误';
         addLog('ERROR', msg);   // addLog 内部已把错误写进 S.errText，不再重复追加
         pushFlow('err', msg);
-        finishRun('ERROR', '任务失败');
+        if (isPixel()) S.pixelTerminal = { level: 'ERROR', note: '任务失败' };
+        else finishRun('ERROR', '任务失败');
         showRawTab('err');
         break;
       }
@@ -1834,13 +1911,13 @@
     const folded = foldThinking();
     if (folded) addLog('LOG', `已自动折叠 ${folded} 段思维链`);
     renderFlow(true);
-    if (S.svg) scheduleValidate();
+    if (!isPixel() && S.svg) scheduleValidate();
   }
   // ── 工程 / 图层（对话历史属于工程，不再有「新建/连续」二选一） ──
   function setMode() { setRunningUI(S.running); }
 
   // 当前工程里是否有可延续的历史
-  function hasSession() { return !!(S.project && S.project.open && S.session); }
+  function hasSession() { return !!(hasWorkspaceProject() && S.session); }
 
   const HINTS = {
     multiOn: '<b>多步修改</b>：模型可分层创建、读取、编辑，逐步细化。',
@@ -2392,8 +2469,11 @@
   // 应用工程快照到界面（图层树 + 画布）
   function applyProject(pj, opts) {
     if (!pj) return;
+    if (pj.open && projectEngine(pj) !== workspace && !(opts?.keepWorkspace)) showWorkspace(projectEngine(pj));
+    if (pj.engine === 'pixel' && S.project?.projectId === pj.projectId && pj.revision < S.project.revision) return;
     if (!pj.open) {
       S.project = pj;
+      pixel?.setProject(null);
       renderLayers();
       renderHints();
       updateProjectBadge();
@@ -2401,9 +2481,16 @@
     }
     const prevActive = S.project && S.project.activeLayer;
     S.project = pj;
-    if (!S.pickedLayer || !pj.layers.some((l) => l.id === S.pickedLayer)) {
+    if (pj.engine === 'pixel' || !S.pickedLayer || !pj.layers.some((l) => l.id === S.pickedLayer)) {
       S.pickedLayer = pj.activeLayer || (pj.layers[0] && pj.layers[0].id) || '';
     }
+    if (pj.engine === 'pixel') {
+      pixel?.setProject(pj, opts);
+      renderLayers();
+      updateProjectBadge();
+      return;
+    }
+    pixel?.setProject(null);
     if (pj.canvas && pj.canvas.width) {
       S.canvas = pj.canvas;
       if (S.settings) S.settings.canvas = pj.canvas;
@@ -2422,12 +2509,12 @@
     const b = $('btnProject');
     if (!b) return;
     const pj = S.project;
-    if (!pj || !pj.open) {
+    if (!hasWorkspaceProject()) {
       b.textContent = '工程：未打开';
       b.title = '点击选择快速模式或打开工程文件夹';
       return;
     }
-    const tag = pj.mode === 'quick' ? '快速' : '工程';
+    const tag = pj.mode === 'quick' ? (isPixel() ? '临时' : '快速') : '工程';
     b.textContent = `工程：${pj.name || '未命名'}（${tag}）`;
     b.title = pj.dir || '';
   }
@@ -2448,9 +2535,18 @@
     if (!box) return;
     box.innerHTML = '';
     const pj = S.project;
-    const on = !!(S.settings && S.settings.layers && S.settings.layers.enabled);
+    const on = isPixel() || !!(S.settings && S.settings.layers && S.settings.layers.enabled);
     $('layerBlock').classList.toggle('hidden', !on);
-    if (!pj || !pj.open) {
+    if (isPixel()) {
+      const active = hasWorkspaceProject() && pj.layers?.find((layer) => layer.id === pj.activeLayer);
+      const editable = Boolean(active) && !S.running && !preparingPixelRun;
+      $('pixelLayerOpacity').disabled = !editable;
+      $('pixelBlend').disabled = !editable;
+      $('pixelDuplicate').disabled = !editable;
+      $('pixelLayerOpacity').value = active ? Math.round((active.opacity ?? 1) * 100) : 100;
+      $('pixelBlend').value = active?.blend || 'normal';
+    }
+    if (!hasWorkspaceProject()) {
       box.appendChild(el('div', 'flow-empty', '（尚未打开工程）'));
       $('layerMeta').textContent = '—';
       $('layerActive').textContent = '当前：—';
@@ -2463,15 +2559,16 @@
     $('layerActive').textContent = `当前：${activeName}`;
 
     list.forEach((l) => {
-      const row = el('div', 'layer-row' + (l.id === pj.activeLayer ? ' active' : '') + (l.visible ? '' : ' hidden-layer'));
+      const visible = isPixel() ? pixel.visibleForPreview(l) : l.visible;
+      const row = el('div', 'layer-row' + (l.id === pj.activeLayer ? ' active' : '') + (visible ? '' : ' hidden-layer'));
       row.dataset.id = l.id;
 
       // 眼睛：可见度
-      const eye = el('span', 'eye' + (l.visible ? '' : ' off'), l.visible ? '◉' : '○');
-      eye.title = l.visible ? '隐藏图层' : '显示图层';
+      const eye = el('span', 'eye' + (visible ? '' : ' off'), visible ? '◉' : '○');
+      eye.title = (visible ? '隐藏图层' : '显示图层') + (isPixel() && S.running ? '（仅本地预览）' : '');
       eye.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        layerOp('visible', { id: l.id, visible: !l.visible });
+        layerOp('visible', { id: l.id, visible: !visible });
       });
 
       // 锁：锁定后模型不能改这一层
@@ -2483,7 +2580,7 @@
       });
 
       const nm = el('span', 'nm', l.name || l.id);
-      nm.title = `${l.file || ''} · ${l.elements || 0} 元素 · ${l.bytes || 0} 字节（双击改名）`;
+      nm.title = `${l.file || ''} · ${l.elements || 0} ${isPixel() ? '非透明像素' : '元素'} · ${l.bytes || 0} 字节（双击改名）`;
       nm.addEventListener('dblclick', (ev) => {
         ev.stopPropagation();
         startRenameLayer(row, l);
@@ -2529,6 +2626,18 @@
   // 图层操作统一入口
   async function layerOp(op, payload) {
     if (layerState.busy) return;
+    if (isPixel()) {
+      if (!hasWorkspaceProject()) return;
+      if (S.running) {
+        if (op === 'visible') {
+          pixel.previewLayer(payload.id, payload.visible);
+          renderLayers();
+        } else if (op !== 'active') toast('请在生成结束后编辑图层', true);
+        return;
+      }
+      await pixel.mutate('/api/layers/ops', { op, ...payload });
+      return;
+    }
     layerState.busy = true;
     try {
       const r = await api('/api/layers/ops', { method: 'POST', body: Object.assign({ op }, payload) });
@@ -2542,7 +2651,7 @@
 
   // 当前选中图层
   function pickedLayer() {
-    if (!S.project || !S.project.open) return null;
+    if (!hasWorkspaceProject()) return null;
     const id = S.pickedLayer || S.project.activeLayer;
     return (S.project.layers || []).find((l) => l.id === id) || null;
   }
@@ -2559,9 +2668,22 @@
 
   // 图层按钮
   $('btnAddLayer').addEventListener('click', async () => {
-    if (!S.project || !S.project.open) { toast('请先打开工程', true); return; }
+    if (!hasWorkspaceProject()) { toast('请先打开工程', true); return; }
     await layerOp('add', { name: '新图层' });
     addLog('LOG', '新建图层');
+  });
+  $('pixelLayerOpacity').addEventListener('change', () => {
+    const layer = pickedLayer();
+    const opacity = Math.max(0, Math.min(1, Number($('pixelLayerOpacity').value) / 100));
+    if (layer && Number.isFinite(opacity)) layerOp('opacity', { id: layer.id, opacity });
+  });
+  $('pixelBlend').addEventListener('change', () => {
+    const layer = pickedLayer();
+    if (layer) layerOp('blend', { id: layer.id, blend: $('pixelBlend').value });
+  });
+  $('pixelDuplicate').addEventListener('click', () => {
+    const layer = pickedLayer();
+    if (layer) layerOp('duplicate', { id: layer.id });
   });
   $('btnLayerDel').addEventListener('click', () => {
     const l = pickedLayer();
@@ -2712,10 +2834,10 @@
     const m = $('modalProject');
     if (m) m.dataset.noClose = boot ? '1' : ''; // 遮罩点击不关，必须先选一项
     const title = $('projTitle');
-    if (title) title.textContent = boot ? '选择打开方式' : '工程';
+    if (title) title.textContent = isPixel() ? '像素画工程' : boot ? '选择打开方式' : '工程';
     const closeBtn = $('projClose');
     if (closeBtn) closeBtn.classList.toggle('hidden', boot);
-    $('projPath').textContent = (S.project && S.project.dir) ? S.project.dir : '—';
+    $('projPath').textContent = hasWorkspaceProject() ? S.project.dir || '—' : '—';
     openModal('modalProject');
   }
 
@@ -2751,9 +2873,28 @@
   }
 
   async function projectAction(path, body, note) {
+    const pixelProjectOpen = S.project?.open && projectEngine() === 'pixel';
+    if ((isPixel() || pixelProjectOpen) && (S.running || preparingPixelRun || S.clearing || pixel?.actionBusy)) {
+      toast('请先结束当前任务', true);
+      return null;
+    }
+    if (pixelProjectOpen) pixel.runState(true);
     try {
+      if (pixelProjectOpen) await pixel.flush();
+      const oldProject = S.project;
       const r = await api(path, { method: 'POST', body });
-      if (r && r.project) applyProject(r.project);
+      if (r && r.project) {
+        if (r.project.engine === 'pixel' && path === '/api/project/open') pixel.reset();
+        applyProject(r.project);
+      }
+      if (oldProject?.projectId !== r?.project?.projectId && (oldProject?.engine === 'pixel' || r?.project?.engine === 'pixel')) {
+        S.session = '';
+        S.liveSession = '';
+        S.rawText = S.thinkText = S.errText = '';
+        S.flow = [];
+        renderFlow();
+        setRunningUI(false);
+      }
       addLog('LOG', note || '工程已更新');
       bootPickOpen = false;
       closeModal('modalProject', true);
@@ -2761,24 +2902,31 @@
       await loadProjectMeta();
       // 换了工程就解锁生成方式：新工程的会话是新的，切换资格也该重置。
       // 「快速生成」额外解动图单向门（清空重来 = 新的快速会话）；其余入口不解。
-      if (body && body.mode === 'quick') genResetToQuick();
-      else genUnlock();
+      if (!isPixel()) {
+        if (body && body.mode === 'quick') genResetToQuick();
+        else genUnlock();
+      }
       return r;
     } catch (e) {
       toast('操作失败：' + e.message, true);
       return null;
+    } finally {
+      if (pixelProjectOpen) pixel.runState(false);
     }
   }
   async function loadProjectMeta() {
     try {
       const r = await api('/api/project');
       S.projectMeta = r;
-      if (r.project) applyProject(r.project, { keepCanvas: true });
+      if (r.project) applyProject(r.project, { keepCanvas: true, keepWorkspace: true });
       return r;
     } catch { return null; }
   }
 
-  $('btnProject').addEventListener('click', () => openProjectModal());
+  $('btnProject').addEventListener('click', () => {
+    if (isPixel() && (preparingPixelRun || S.running)) { toast('请先结束当前任务', true); return; }
+    openProjectModal();
+  });
   $('projClose').addEventListener('click', () => closeModal('modalProject'));
 
   // 方框一：快速生成 → 清掉临时工程，空画板直接开工
@@ -2806,10 +2954,17 @@
       onOk: go,
     });
   });
+  $('pixelQuickNew').addEventListener('click', () => {
+    projectAction('/api/project/open', { mode: 'quick', engine: 'pixel', fresh: false }, '已打开临时像素画板');
+  });
 
   // 方框二：新建项目 → 只填名字，确认后弹文件夹选择器选位置
   $('btnProjNew').addEventListener('click', () => {
     $('projNameInput').value = '';
+    if (isPixel()) {
+      $('pixelProjectWidth').value = $('pixelWidth').value;
+      $('pixelProjectHeight').value = $('pixelHeight').value;
+    }
     openModal('modalNewProj');
     setTimeout(() => $('projNameInput').focus(), 30);
   });
@@ -2823,16 +2978,23 @@
       $('projNameInput').focus();
       return;
     }
+    const width = Number($('pixelProjectWidth').value);
+    const height = Number($('pixelProjectHeight').value);
+    if (isPixel() && ![width, height].every((value) => Number.isInteger(value) && value >= 8 && value <= 512)) {
+      toast('像素画布的宽和高都须为 8–512 的整数', true);
+      return;
+    }
     const dir = await pickFolder('选择「' + name + '」的存放位置');
     if (!dir) return; // 取消选择就留在原地
-    projectAction('/api/project/create', { name, dir }, '已新建项目 ' + name);
+    const request = isPixel() ? { name, dir, engine: 'pixel', pixel: { width, height } } : { name, dir };
+    projectAction('/api/project/create', request, '已新建项目 ' + name);
   });
 
   // 方框三：打开项目 → 直接弹文件夹选择器
   $('btnProjOpen').addEventListener('click', async () => {
     const dir = await pickFolder('选择项目文件夹');
     if (!dir) return;
-    projectAction('/api/project/open', { mode: 'project', dir }, '已打开项目 ' + dir);
+    projectAction('/api/project/open', { mode: 'project', dir, engine: workspace }, '已打开项目 ' + dir);
   });
 
   // 清空画板视图（不动工程文件）
@@ -2864,6 +3026,10 @@
 
   // ── 开始 / 停止（单按钮切换） ───────────────────────────
   function setRunningUI(on) {
+    if (isPixel()) {
+      pixel.runState(Boolean(on || preparingPixelRun || S.clearing));
+      renderLayers();
+    }
     $('fastMode').disabled = !!on || !fastModeAvailable();
     const b = $('btnRun');
     if (!b) return;
@@ -2880,7 +3046,7 @@
       b.textContent = '开始生成';
       b.title = '开始生成（Ctrl+Enter）';
     }
-    b.disabled = S.clearing;
+    b.disabled = S.clearing || (isPixel() && preparingPixelRun);
     // 停止阶段：按钮进入「正在停止」，任何点击都直接再打一次 abort。
     b.classList.toggle('stopping', !!on && S.stopping);
     if (on && S.stopping) {
@@ -2906,31 +3072,50 @@
     updateBadge();
   }
   async function startRun() {
-    if (S.running || S.clearing) return;
+    if (S.running || S.clearing || preparingPixelRun || switchingWorkspace) return;
+    const pixelRun = isPixel();
     const pendingSeq = S.runSeq;
     if (!S.settings) { toast('设置尚未加载', true); return; }
     syncInputsToSettings();
     const prompt = $('prompt').value.trim();
-    if (!prompt) { $('prompt').focus(); toast('请先填写提示词', true); return; }
+    const pixelMode = pixelRun ? $('pixelDraft').value : '';
+    const implicitPrompt = pixelRun && (pixelMode === 'vision' ? pixel.hasAssets : pixelMode === 'quantize' && pixel.canDraft);
+    if (!prompt && !implicitPrompt) { $('prompt').focus(); toast('请先填写提示词', true); return; }
     const p = activeProvider();
     if (!p) { toast('没有可用供应商', true); return; }
     const model = (S.settings.activeModel || '').trim();
     if (!model) { toast('请先在右上角选择模型', true); return; }
     if (!p.apiKey && p.authMode !== 'chatgpt') { toast('该供应商还没有填写 API Key', true); return; }
-    if (!S.canvas) { toast('请选择比例预设', true); return; }
-    if (!S.project || !S.project.open) {
-      toast('请先选择打开方式（快速生成 / 新建项目 / 打开项目）', true);
+    if (!pixelRun && !S.canvas) { toast('请选择比例预设', true); return; }
+    if (!hasWorkspaceProject()) {
+      toast(pixelRun ? '请先打开像素工程' : '请先选择打开方式（快速生成 / 新建项目 / 打开项目）', true);
       openProjectModal();
       return;
     }
-
-    try {
-      await flushPersist();
-    } catch (e) {
-      toast('设置保存失败：' + e.message, true);
+    if (pixelRun && !pixel.editable) return;
+    if (pixelRun && pixelMode === 'quantize' && !pixel.canDraft) {
+      toast('请先添加主图，或选择另一条创作路径', true);
       return;
     }
-    if (S.running || S.clearing || pendingSeq !== S.runSeq) return;
+
+    if (pixelRun) preparingPixelRun = true;
+    try {
+      await flushPersist();
+      if (pixelRun) {
+        if (pixelMode === 'quantize' && !pixel.hasDraft && !(await pixel.quantize())) return;
+        pixel.runState(true);
+        await pixel.flush();
+      }
+    } catch (e) {
+      toast((pixelRun ? '发送前同步失败：' : '设置保存失败：') + e.message, true);
+      return;
+    } finally {
+      if (pixelRun) {
+        preparingPixelRun = false;
+        setRunningUI(false);
+      }
+    }
+    if (S.running || S.clearing || pendingSeq !== S.runSeq || pixelRun !== isPixel()) return;
 
     S.running = true;
     const controller = new AbortController();
@@ -2939,7 +3124,11 @@
     S.stopping = false;
     const seq = ++S.runSeq;
     // 一旦开始生成就锁定生成方式：当前若停在快速模式，还留最后一次切换机会。
-    genLock();
+    if (!pixelRun) genLock();
+    if (pixelRun) {
+      pixel.beginTurn();
+      S.pixelTerminal = null;
+    }
     // 快速模式：工程目录是临时的，开新会话前丢掉上一轮上下文。
     // 工程模式：沿用工程的会话 id（历史随工程持久化）。
     if (S.project.mode === 'quick' && !S.session) {
@@ -2956,17 +3145,16 @@
     renderFlow();
     setRunningUI(true);
     updateBadge();
-    addLog('LOG', `开始生成 · ${p.name} / ${model} · ${S.canvas.name}`);
+    const sizeLabel = pixelRun ? `${S.project.pixel.width}×${S.project.pixel.height}` : S.canvas.name;
+    addLog('LOG', `开始生成 · ${p.name} / ${model} · ${sizeLabel}`);
     if (S.settings.fastMode && fastModeAvailable()) {
       $('fastModeStatus').textContent = '已请求 Fast，等待服务端确认…';
       addLog('LOG', '已请求 Fast 加速；可能增加额度或费用消耗');
     }
-    if (S.images.length) addLog('LOG', `附带 ${S.images.length} 张图片`);
+    if (!pixelRun && S.images.length) addLog('LOG', `附带 ${S.images.length} 张图片`);
 
     const body = {
       prompt,
-      images: S.images.map((i) => ({ mime: i.mime, data: i.data })),
-      canvas: S.canvas,
       model,
       providerId: p.id,
       thinking: selValue('thinkingSel') || 'off',
@@ -2974,10 +3162,14 @@
       session: S.session,
       runId: S.runID,
       layer: S.pickedLayer || '',
-      genMode: S.genMode,
-      multiStep: S.genMode === 'layers',
     };
+    if (pixelRun) Object.assign(body, pixel.requestFields(), { pixelDraftMode: pixelMode });
+    else Object.assign(body, {
+      images: S.images.map((i) => ({ mime: i.mime, data: i.data })),
+      canvas: S.canvas, genMode: S.genMode, multiStep: S.genMode === 'layers',
+    });
 
+    let rejectedBeforeStream = false;
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -2986,6 +3178,7 @@
         signal: controller.signal,
       });
       if (!res.ok) {
+        rejectedBeforeStream = true;
         const ct = res.headers.get('content-type') || '';
         let msg = `HTTP ${res.status}`;
         try {
@@ -3022,7 +3215,18 @@
       // 用户主动停止：已由 haltRunLocal 收尾，这里不再报「连接意外结束」。
       if (stale()) return;
       if (buf.trim()) handleFrame(buf);
-      if (!finished && S.running) {
+      if (pixelRun && S.running && !S.stopping) {
+        if (finished && S.pixelTerminal) {
+          await refreshProject();
+          if (!stale() && !S.stopping) {
+            pixel.finishTurn();
+            finishRun(S.pixelTerminal.level, S.pixelTerminal.note);
+          }
+        } else {
+          addLog('ERROR', '连接意外结束，正在确认最后一次画布更新');
+          await stopPixelRun();
+        }
+      } else if (!pixelRun && !finished && S.running) {
         finishRun('ERROR', '连接意外结束');
         showRawTab('err');
       }
@@ -3041,17 +3245,47 @@
     } catch (e) {
       if (seq !== S.runSeq) return; // 已停止，错误无意义
       addLog('ERROR', '请求失败：' + e.message);
-      finishRun('ERROR', '请求失败');
+      if (pixelRun && !rejectedBeforeStream) {
+        if (!S.stopping) await stopPixelRun();
+      } else finishRun('ERROR', '请求失败');
       showRawTab('err');
     } finally {
       if (S.streamAbort === controller) S.streamAbort = null;
     }
   }
 
+  function stopPixelRun() {
+    if (pixelStop) return pixelStop;
+    const seq = S.runSeq;
+    S.stopping = true;
+    setRunningUI(true);
+    pixelStop = (async () => {
+      try {
+        const result = await api('/api/chat/abort', {
+          method: 'POST', body: { session: S.session, runId: S.runID, wait: true, projectId: S.project.projectId },
+        });
+        if (seq !== S.runSeq) return false;
+        if (!result?.project) throw new Error('未收到停止后的工程快照');
+        applyProject(result.project);
+        pixel.finishTurn();
+        haltRunLocal();
+        addLog('LOG', '已中止生成');
+        toast('已中止生成');
+        return true;
+      } catch (error) {
+        addLog('ERROR', '未确认停止：' + error.message);
+        toast('未确认停止，可以再次点击停止或重载页面', true);
+        return false;
+      } finally { pixelStop = null; }
+    })();
+    return pixelStop;
+  }
+
   // 立即切断：先把前端收干净（按钮/流/状态），再异步通知后端。
   // 后端 Abort 是 context.Cancel，SSE 会随即断；前端不再等它。
   function stopRunNow() {
     if (!S.running) return;
+    if (isPixel()) return stopPixelRun();
     const session = S.session;
     const runId = S.runID;
     S.stopping = true;
@@ -3078,7 +3312,7 @@
       startRun();
     } else if (e.key === '`' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      setCodeView(!S.codeOpen);
+      if (!isPixel()) setCodeView(!S.codeOpen);
     } else if (e.key === 'Escape') {
       if (MM.open) { closeModelMenu(); return; }
       if (anySelOpen()) { closeAllSels(''); return; }
@@ -3093,7 +3327,8 @@
         return;
       }
       if (S.running) { e.preventDefault(); stopRun(); }
-    }
+      else if (isPixel()) pixel.onKey(e);
+    } else if (isPixel() && !document.querySelector('.modal:not(.hidden)')) pixel.onKey(e);
   });
 
   // ── 代码视图：把 SVG 排版成可折叠的行 ──────────────────
@@ -3256,7 +3491,7 @@
   }
   // ── 清空全部：停止任务、重置作品及对话、清空本地显示 ─────
   $('btnClear').addEventListener('click', () => {
-    if (S.clearing) return;
+    if (S.clearing || preparingPixelRun || (isPixel() && !hasWorkspaceProject())) return;
     confirmBox({
       title: '清空全部',
       icon: '!',
@@ -3265,11 +3500,18 @@
       onOk: async () => {
         S.clearing = true;
         try {
-          if (S.running) stopRunNow();
+          if (isPixel()) {
+            if (S.running && !(await stopPixelRun())) throw new Error('生成任务尚未停止');
+            await pixel.flush();
+            setRunningUI(false);
+          } else if (S.running) stopRunNow();
           haltRunLocal();
-          const result = await api('/api/session/drop', { method: 'POST', body: { session: S.session || '' } });
+          const body = { session: S.session || '' };
+          const result = await api('/api/session/drop', {
+            method: 'POST', body: isPixel() ? pixel.requestWithRevision(body) : body,
+          });
           haltRunLocal();
-          if (result && result.project) applyProject(result.project, { keepCanvas: true });
+          if (result && result.project) applyProject(result.project, { keepCanvas: true, reload: isPixel() });
         } catch (e) {
           S.clearing = false;
           setRunningUI(S.running);
@@ -3283,10 +3525,17 @@
         $('prompt').value = '';
         previewSVG = '';
         S.livePreview = false;
-        resetWorkspaceView();
-        genUnlock();
+        if (isPixel()) {
+          pixel.reset();
+          S.rawText = S.thinkText = S.errText = '';
+          S.flow = [];
+          renderFlow();
+        } else {
+          resetWorkspaceView();
+          genUnlock();
+        }
         updateUsage({});
-        renderThumbs();
+        if (!isPixel()) renderThumbs();
         $('bigLog').innerHTML = '';
         S.clearing = false;
         setRunningUI(false);
@@ -3299,12 +3548,24 @@
   // ── 退出询问（宿主关窗口前调 appClosing，这里问「另存为工程 / 直接丢弃」） ──
   // 返回 false = 用户取消退出，拦住这次关闭。
   window.dshSaveChoice = async function dshSaveChoice() {
+    if (S.project?.engine === 'pixel' && S.project.open) {
+      if (preparingPixelRun || pixel.actionBusy) return false;
+      try {
+        if (S.running && !(await stopPixelRun())) return false;
+        await pixel.flush();
+      } catch (error) {
+        toast('笔触尚未保存：' + error.message, true);
+        return false;
+      }
+    }
     if (!(S.project && S.project.open && S.project.mode === 'quick')) return true;
     const choice = await chooseExit();
     if (choice === 'cancel') return false;
     if (choice === 'keep') {
       // 另存为工程：临时工程复制成正式工程，之后照常退出。
-      await projectAction('/api/project/saveas', { dir: `data/projects/svg-${stamp()}` }, '已另存为工程');
+      const prefix = projectEngine() === 'pixel' ? 'pixel' : 'svg';
+      const saved = await projectAction('/api/project/saveas', { dir: `data/projects/${prefix}-${stamp()}` }, '已另存为工程');
+      if (!saved && prefix === 'pixel') return false;
     } else {
       await api('/api/project/close', { method: 'POST', body: { purgeQuick: true } }).catch(() => {});
     }
@@ -3378,6 +3639,22 @@
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
     addLog('LOG', '已导出 ' + a.download);
+  });
+  $('pixelSave').addEventListener('click', async () => {
+    if (!hasWorkspaceProject() || !pixel.editable) return;
+    if (S.project.mode === 'quick') {
+      const dir = await pickFolder('选择像素工程的存放位置');
+      if (!dir) return;
+      const result = await projectAction('/api/project/saveas', { dir }, '像素工程已保存');
+      if (result) toast('像素工程已保存');
+      return;
+    }
+    if (await pixel.mutate('/api/project/save', {})) toast('像素工程已保存');
+  });
+  window.addEventListener('beforeunload', (event) => {
+    if (projectEngine() !== 'pixel' || !pixel?.hasPending) return;
+    event.preventDefault();
+    event.returnValue = '';
   });
 
   // 保存按钮的提示随工程模式 / 动图模式变化

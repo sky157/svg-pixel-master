@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,7 +59,12 @@ func TestGenerationRPCProcess(t *testing.T) {
 			send(map[string]any{"id": "tool-request-1", "method": "item/tool/call", "params": map[string]any{"threadId": "thread-1", "callId": "call-1", "tool": "emit_svg", "arguments": map[string]string{"svg": "<svg/>"}}})
 			continue
 		case "":
-			if string(req.ID) != `"tool-request-1"` || req.Result.Success || len(req.Result.Items) == 0 || req.Result.Items[0]["text"] != "Fix invalid SVG" {
+			pixelBudgetNotice := len(req.Result.Items) == 2 && req.Result.Items[1]["type"] == "inputText" &&
+				strings.Contains(fmt.Sprint(req.Result.Items[1]["text"]), "pixel_read_region")
+			inlineImage := len(req.Result.Items) == 2 && req.Result.Items[1]["type"] == "inputImage" &&
+				req.Result.Items[1]["imageUrl"] == "data:image/png;base64,aW1hZ2U="
+			if string(req.ID) != `"tool-request-1"` || req.Result.Success || len(req.Result.Items) != 2 ||
+				req.Result.Items[0]["text"] != "Fix invalid SVG" || !(inlineImage || pixelBudgetNotice) {
 				os.Exit(2)
 			}
 			notify("thread/tokenUsage/updated", map[string]any{"tokenUsage": map[string]any{"total": map[string]int{"inputTokens": 180, "outputTokens": 20, "totalTokens": 200}}})
@@ -129,8 +136,15 @@ func TestGenerationToolRoundTripAndHistory(t *testing.T) {
 	if callID != "call-1" {
 		t.Fatalf("missing tool call: %+v", events)
 	}
-	req.Messages = append(req.Messages, llm.Message{Role: llm.RoleTool, Blocks: []llm.Block{{Type: llm.BlockToolResult, ToolResult: &llm.ToolResult{CallID: callID, Content: "Fix invalid SVG", IsError: true}}}})
+	req.Messages = append(req.Messages, llm.Message{Role: llm.RoleTool, Blocks: []llm.Block{{
+		Type: llm.BlockToolResult, ToolResult: &llm.ToolResult{
+			CallID: callID, Content: "Fix invalid SVG", IsError: true, Images: []llm.ImageData{{Data: "aW1hZ2U="}},
+		},
+	}}})
 	events = collect(t, c, req)
+	if c.pixelImageBytes != len("aW1hZ2U=") {
+		t.Fatal("the dynamic tool response lost its image")
+	}
 	// 线程累计快照会被多次推送：本 pump 起始快照是 110（上一轮留下的 a.usage），
 	// 随后 200、205。增量必须逐次前移，所以各事件之和应等于 205−110=95，
 	// 而不是把中间快照重复计入（那会得到 90+95=185）。
@@ -159,6 +173,38 @@ func TestGenerationToolRoundTripAndHistory(t *testing.T) {
 	}
 	if !state["history"] || !state["unsubscribed"] || state["interrupted"] {
 		t.Fatal(state)
+	}
+}
+
+func TestToolImageCodexPixelBudget(t *testing.T) {
+	_, c, req := generationFixture(t)
+	req.Pixel = true
+	_ = collect(t, c, req)
+	c.pixelImageBytes = maxCodexPixelImageBytes
+	req.Messages = append(req.Messages, llm.Message{Role: llm.RoleTool, Blocks: []llm.Block{{
+		Type: llm.BlockToolResult, ToolResult: &llm.ToolResult{
+			CallID: "call-1", Content: "Fix invalid SVG", IsError: true, Images: []llm.ImageData{{Data: "aW1hZ2U="}},
+		},
+	}}})
+	_ = collect(t, c, req)
+	if c.pixelImageBytes != maxCodexPixelImageBytes {
+		t.Fatal("an already full Codex turn accepted more visual data")
+	}
+}
+
+func TestToolImagesInCodexHistory(t *testing.T) {
+	items, err := historyItems([]llm.Message{{Role: llm.RoleTool, Blocks: []llm.Block{
+		{Type: llm.BlockToolResult, ToolResult: &llm.ToolResult{
+			CallID: "call-inspect", Name: "pixel_inspect", Content: "seen", Images: []llm.ImageData{{MIME: "image/png", Data: "aW1hZ2U="}},
+		}},
+		{Type: llm.BlockToolResult, ToolResult: &llm.ToolResult{CallID: "call-draw", Content: "drawn"}},
+	}}})
+	if err != nil || len(items) != 3 || items[0]["call_id"] != "call-inspect" || items[1]["call_id"] != "call-draw" || items[2]["role"] != llm.RoleUser {
+		t.Fatalf("incorrect injected history: %+v %v", items, err)
+	}
+	parts := items[2]["content"].([]map[string]any)
+	if len(parts) != 2 || parts[1]["image_url"] != "data:image/png;base64,aW1hZ2U=" {
+		t.Fatalf("missing inspection image from injected history: %+v", parts)
 	}
 }
 

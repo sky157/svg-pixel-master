@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"svg-master/internal/config"
@@ -35,7 +36,7 @@ type respInputItem struct {
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
 	// function_call_output
-	Output *string `json:"output,omitempty"`
+	Output any `json:"output,omitempty"`
 }
 
 type respToolOut struct {
@@ -64,6 +65,10 @@ type respRequestOut struct {
 }
 
 func (c *openaiResponses) buildBody(req Request) ([]byte, error) {
+	return c.buildBodyWithToolImages(req, false)
+}
+
+func (c *openaiResponses) buildBodyWithToolImages(req Request, legacyToolImages bool) ([]byte, error) {
 	out := respRequestOut{
 		ServiceTier:    req.ServiceTier,
 		Model:          req.Model,
@@ -73,12 +78,23 @@ func (c *openaiResponses) buildBody(req Request) ([]byte, error) {
 		Include:        []string{"reasoning.encrypted_content"},
 		PromptCacheKey: req.SessionID,
 	}
+	// GPT-6.2 appends top-level instructions after input. Keep Pixel Studio's
+	// reusable rules first on that model family.
+	if req.Pixel && strings.HasPrefix(strings.ToLower(req.Model), "gpt-6.2") && req.System != "" {
+		first := respInputItem{Role: "developer", Content: []respContentPart{{Type: "input_text", Text: req.System}}}
+		raw, err := json.Marshal(first)
+		if err != nil {
+			return nil, err
+		}
+		out.Instructions = ""
+		out.Input = append(out.Input, raw)
+	}
 	for _, m := range req.Messages {
 		if m.Role == RoleAssistant && m.NativeOutput != nil && m.NativeOutput.Protocol == c.Protocol() && len(m.NativeOutput.Items) > 0 {
 			out.Input = append(out.Input, m.NativeOutput.Items...)
 			continue
 		}
-		for _, item := range encodeRespMessage(m) {
+		for _, item := range encodeRespMessage(m, legacyToolImages) {
 			raw, err := json.Marshal(item)
 			if err != nil {
 				return nil, err
@@ -109,10 +125,11 @@ func (c *openaiResponses) buildBody(req Request) ([]byte, error) {
 }
 
 // encodeRespMessage 把中间表示消息转成 Responses 的 input item 列表。
-func encodeRespMessage(m Message) []respInputItem {
+func encodeRespMessage(m Message, legacyToolImages bool) []respInputItem {
 	var items []respInputItem
 	var parts []respContentPart
 	var calls []respInputItem
+	var resultImages []respContentPart
 
 	for _, b := range m.Blocks {
 		switch b.Type {
@@ -131,7 +148,7 @@ func encodeRespMessage(m Message) []respInputItem {
 			}
 			parts = append(parts, respContentPart{
 				Type:     "input_image",
-				ImageURL: imageDataURL(*b.Image),
+				ImageURL: b.Image.DataURL(),
 				Detail:   "auto",
 			})
 		case BlockToolCall:
@@ -148,11 +165,23 @@ func encodeRespMessage(m Message) []respInputItem {
 			if b.ToolResult == nil {
 				continue
 			}
-			output := toolResultText(b.ToolResult)
+			result := b.ToolResult
+			output := responsesToolOutput(result)
+			if legacyToolImages {
+				output = toolResultText(result)
+				for _, img := range result.Images {
+					if img.Data != "" {
+						resultImages = append(resultImages,
+							respContentPart{Type: "input_text", Text: toolImageCaption(result)},
+							respContentPart{Type: "input_image", ImageURL: img.DataURL(), Detail: "auto"},
+						)
+					}
+				}
+			}
 			items = append(items, respInputItem{
 				Type:   "function_call_output",
-				CallID: b.ToolResult.CallID,
-				Output: &output,
+				CallID: result.CallID,
+				Output: output,
 			})
 		}
 	}
@@ -162,7 +191,28 @@ func encodeRespMessage(m Message) []respInputItem {
 		items = append([]respInputItem{{Role: m.Role, Content: parts}}, items...)
 	}
 	items = append(items, calls...)
+	if len(resultImages) > 0 {
+		items = append(items, respInputItem{Role: RoleUser, Content: resultImages})
+	}
 	return items
+}
+
+func responsesToolOutput(result *ToolResult) any {
+	text := toolResultText(result)
+	var parts []respContentPart
+	for _, img := range result.Images {
+		if img.Data == "" {
+			continue
+		}
+		if len(parts) == 0 && text != "" {
+			parts = append(parts, respContentPart{Type: "input_text", Text: text})
+		}
+		parts = append(parts, respContentPart{Type: "input_image", ImageURL: img.DataURL(), Detail: "auto"})
+	}
+	if len(parts) == 0 {
+		return text
+	}
+	return parts
 }
 
 func (c *openaiResponses) url() string {
@@ -184,7 +234,23 @@ func (c *openaiResponses) Stream(ctx context.Context, req Request) (<-chan Strea
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, httpError("openai-responses 请求失败", resp)
+		err = httpError("openai-responses 请求失败", resp)
+		if !responsesRejectsToolImageArray(resp.StatusCode, err, req) {
+			return nil, err
+		}
+		// Some compatible gateways accept only string function outputs. Keep
+		// paired output items intact and send their images in a following message.
+		body, err = c.buildBodyWithToolImages(req, true)
+		if err != nil {
+			return nil, noRetry(fmt.Errorf("编码 openai-responses 兼容请求失败：%w", err))
+		}
+		resp, err = d.postJSON(ctx, c.url(), headers, body)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, httpError("openai-responses 兼容请求失败", resp)
+		}
 	}
 
 	if !req.Stream || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") {
@@ -209,6 +275,25 @@ func (c *openaiResponses) Stream(ctx context.Context, req Request) (<-chan Strea
 		p.run(func(ev sseEvent) (bool, error) { return c.handleFrame(p, ev, st) })
 	}()
 	return ch, nil
+}
+
+func responsesRejectsToolImageArray(status int, err error, req Request) bool {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, "output") || !strings.Contains(message, "string") ||
+		(!strings.Contains(message, "array") && !strings.Contains(message, "list")) {
+		return false
+	}
+	for _, msg := range req.Messages {
+		for _, b := range msg.Blocks {
+			if b.ToolResult != nil && len(b.ToolResult.Images) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type respItemIn struct {

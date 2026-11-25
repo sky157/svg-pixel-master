@@ -32,8 +32,9 @@ type geminiPartOut struct {
 }
 
 type geminiInlineData struct {
-	MIMEType string `json:"mimeType"`
-	Data     string `json:"data"`
+	MIMEType    string `json:"mimeType"`
+	Data        string `json:"data"`
+	DisplayName string `json:"displayName,omitempty"`
 }
 
 type geminiFuncCall struct {
@@ -43,9 +44,14 @@ type geminiFuncCall struct {
 }
 
 type geminiFuncResp struct {
-	ID       string          `json:"id,omitempty"`
-	Name     string          `json:"name"`
-	Response json.RawMessage `json:"response"`
+	ID       string                       `json:"id,omitempty"`
+	Name     string                       `json:"name"`
+	Response map[string]any               `json:"response"`
+	Parts    []geminiFunctionResponsePart `json:"parts,omitempty"`
+}
+
+type geminiFunctionResponsePart struct {
+	InlineData geminiInlineData `json:"inlineData"`
 }
 
 type geminiContentOut struct {
@@ -53,12 +59,15 @@ type geminiContentOut struct {
 	Parts any    `json:"parts"`
 }
 
+type geminiDeclaration struct {
+	Name                 string          `json:"name"`
+	Description          string          `json:"description,omitempty"`
+	Parameters           json.RawMessage `json:"parameters,omitempty"`
+	ParametersJSONSchema json.RawMessage `json:"parametersJsonSchema,omitempty"`
+}
+
 type geminiToolOut struct {
-	FunctionDeclarations []struct {
-		Name        string          `json:"name"`
-		Description string          `json:"description,omitempty"`
-		Parameters  json.RawMessage `json:"parameters,omitempty"`
-	} `json:"functionDeclarations"`
+	FunctionDeclarations []geminiDeclaration `json:"functionDeclarations"`
 }
 
 type geminiRequestOut struct {
@@ -99,14 +108,14 @@ func (c *geminiClient) buildBody(req Request) ([]byte, error) {
 	}
 
 	for _, t := range req.Tools {
-		var tool geminiToolOut
-		decl := struct {
-			Name        string          `json:"name"`
-			Description string          `json:"description,omitempty"`
-			Parameters  json.RawMessage `json:"parameters,omitempty"`
-		}{Name: t.Name, Description: t.Description, Parameters: normalizeSchema(t.Parameters)}
-		tool.FunctionDeclarations = append(tool.FunctionDeclarations, decl)
-		out.Tools = append(out.Tools, tool)
+		decl := geminiDeclaration{Name: t.Name, Description: t.Description}
+		if req.Pixel {
+			// Pixel drawing declares arbitrary color-legend keys with additionalProperties.
+			decl.ParametersJSONSchema = normalizeSchema(t.Parameters)
+		} else {
+			decl.Parameters = normalizeSchema(t.Parameters)
+		}
+		out.Tools = append(out.Tools, geminiToolOut{FunctionDeclarations: []geminiDeclaration{decl}})
 	}
 
 	gc := &struct {
@@ -147,6 +156,7 @@ func encodeGeminiMessage(m Message, names map[string]string, withID bool) ([]gem
 
 	var parts []geminiPartOut
 	var funcResponses []geminiPartOut
+	var resultImages []geminiPartOut
 
 	for _, b := range m.Blocks {
 		switch b.Type {
@@ -165,11 +175,8 @@ func encodeGeminiMessage(m Message, names map[string]string, withID bool) ([]gem
 			if b.Image == nil || b.Image.Data == "" {
 				continue
 			}
-			mime := b.Image.MIME
-			if mime == "" {
-				mime = "image/png"
-			}
-			parts = append(parts, geminiPartOut{InlineData: &geminiInlineData{MIMEType: mime, Data: b.Image.Data}})
+			media := geminiMedia(*b.Image)
+			parts = append(parts, geminiPartOut{InlineData: &media})
 		case BlockToolCall:
 			if b.ToolCall == nil {
 				continue
@@ -194,6 +201,24 @@ func encodeGeminiMessage(m Message, names map[string]string, withID bool) ([]gem
 			if withID {
 				fr.ID = geminiToolID(b.ToolResult.CallID, name)
 			}
+			var refs []map[string]string
+			for i, img := range b.ToolResult.Images {
+				if img.Data == "" {
+					continue
+				}
+				media := geminiMedia(img)
+				if withID {
+					media.DisplayName = fmt.Sprintf("%s-image-%d", fr.ID, i+1)
+					fr.Parts = append(fr.Parts, geminiFunctionResponsePart{InlineData: media})
+					refs = append(refs, map[string]string{"$ref": media.DisplayName})
+				} else {
+					// Older models receive regular user image parts alongside the complete tool batch.
+					resultImages = append(resultImages, geminiPartOut{Text: toolImageCaption(b.ToolResult)}, geminiPartOut{InlineData: &media})
+				}
+			}
+			if len(refs) > 0 {
+				fr.Response["images"] = refs
+			}
 			funcResponses = append(funcResponses, geminiPartOut{FunctionResponse: fr})
 		}
 	}
@@ -202,23 +227,28 @@ func encodeGeminiMessage(m Message, names map[string]string, withID bool) ([]gem
 	if len(funcResponses) > 0 {
 		parts = append(parts, funcResponses...)
 	}
+	parts = append(parts, resultImages...)
 	if len(parts) == 0 {
 		return nil, nil
 	}
 	return []geminiContentOut{{Role: role, Parts: parts}}, nil
 }
 
+func geminiMedia(img ImageData) geminiInlineData {
+	mime := img.MIME
+	if mime == "" {
+		mime = "image/png"
+	}
+	return geminiInlineData{MIMEType: mime, Data: img.Data}
+}
+
 // geminiFuncResponsePayload 生成 functionResponse.response：{output:...} 或 {error:...}。
-func geminiFuncResponsePayload(tr *ToolResult) json.RawMessage {
+func geminiFuncResponsePayload(tr *ToolResult) map[string]any {
 	key := "output"
 	if tr.IsError {
 		key = "error"
 	}
-	payload, err := json.Marshal(map[string]string{key: sanitizeText(tr.Content)})
-	if err != nil {
-		return json.RawMessage(`{"output":""}`)
-	}
-	return payload
+	return map[string]any{key: sanitizeText(tr.Content)}
 }
 
 // geminiToolID 把调用 id 清洗成 Gemini 允许的形态：仅 [a-zA-Z0-9_-]，最长 64。
