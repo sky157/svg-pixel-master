@@ -20,9 +20,10 @@ func main() {
 	}
 	settings := store.Settings()
 	settings.Providers = nil
+	vision := true
 	for i, protocol := range []string{config.ProtoOpenAIResp, config.ProtoOpenAIChat, config.ProtoAnthropic, config.ProtoGemini} {
 		id := fmt.Sprintf("test%d", i)
-		settings.Providers = append(settings.Providers, config.Provider{ID: id, Name: protocol, Protocol: protocol, BaseURL: "http://127.0.0.1:18999", APIKey: "fake-local-only", Models: []config.ModelEntry{{ID: "test-model", Name: "test-model"}}})
+		settings.Providers = append(settings.Providers, config.Provider{ID: id, Name: protocol, Protocol: protocol, BaseURL: "http://127.0.0.1:18999", APIKey: "fake-local-only", ModelCaps: map[string]config.PartialCaps{"test-model": {Vision: &vision}}, Models: []config.ModelEntry{{ID: "test-model", Name: "test-model"}}})
 	}
 	settings.ActiveProviderID = "test0"
 	settings.ActiveModel = "test-model"

@@ -17,6 +17,7 @@
 package project
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"svg-master/internal/llm"
+	"svg-master/internal/pixel"
 )
 
 // DocVersion 是 project.json 的格式版本。
@@ -49,18 +51,19 @@ var BlendModes = []string{
 
 // Layer 一个图层。内容存放在 layers/<File>，本结构只存元数据。
 type Layer struct {
-	ID       string  `json:"id"`      // 稳定标识，工具调用与前端都用它
-	Name     string  `json:"name"`    // 显示名，可重命名
-	File     string  `json:"file"`    // layers/ 下的文件名
-	Visible  bool    `json:"visible"` // 可见性
-	Locked   bool    `json:"locked"`  // 锁定后禁止 AI 改写
-	Opacity  float64 `json:"opacity"` // 0..1
-	Blend    string  `json:"blend"`   // 混合模式，默认 normal
-	Index    int     `json:"index"`   // 层级，越大越靠上
-	Bytes    int     `json:"bytes"`   // 内容字节数（冗余，便于列表展示）
-	Updated  int64   `json:"updated"` // UnixNano 时间戳
-	Note     string  `json:"note,omitempty"`
-	Elements int     `json:"elements,omitempty"` // 粗略元素计数（冗余展示）
+	ID          string      `json:"id"`      // 稳定标识，工具调用与前端都用它
+	Name        string      `json:"name"`    // 显示名，可重命名
+	File        string      `json:"file"`    // layers/ 下的文件名
+	Visible     bool        `json:"visible"` // 可见性
+	Locked      bool        `json:"locked"`  // 锁定后禁止 AI 改写
+	Opacity     float64     `json:"opacity"` // 0..1
+	Blend       string      `json:"blend"`   // 混合模式，默认 normal
+	Index       int         `json:"index"`   // 层级，越大越靠上
+	Bytes       int         `json:"bytes"`   // 内容字节数（冗余，便于列表展示）
+	Updated     int64       `json:"updated"` // UnixNano 时间戳
+	Note        string      `json:"note,omitempty"`
+	Elements    int         `json:"elements,omitempty"` // 粗略元素计数（冗余展示）
+	PixelRegion *pixel.Rect `json:"pixelRegion,omitempty"`
 }
 
 // MessageRecord 持久化的对话消息。复用 llm.Block 的 JSON 形状，
@@ -74,11 +77,13 @@ type MessageRecord struct {
 
 // File 工程文档（project.json 的顶层结构）。
 type File struct {
-	Version  int    `json:"version"`
-	Kind     string `json:"kind"`
-	Name     string `json:"name"`
-	Created  int64  `json:"created"`
-	Modified int64  `json:"modified"`
+	Engine   string     `json:"engine,omitempty"`
+	Pixel    *PixelMeta `json:"pixel,omitempty"`
+	Version  int        `json:"version"`
+	Kind     string     `json:"kind"`
+	Name     string     `json:"name"`
+	Created  int64      `json:"created"`
+	Modified int64      `json:"modified"`
 
 	Canvas CanvasMeta `json:"canvas"`
 
@@ -108,10 +113,14 @@ type CanvasMeta struct {
 
 // Project 一个打开中的工程。所有导出方法都可并发调用。
 type Project struct {
-	mu   sync.Mutex
-	dir  string // 工程文件夹绝对路径
-	kind string // quick | user
-	file File
+	mu           sync.Mutex
+	dir          string // 工程文件夹绝对路径
+	kind         string // quick | user
+	file         File
+	id           string
+	pixelPending *pixelCheckpoint
+	pixelUndo    *pixelCheckpoint
+	pixelRedo    *pixelCheckpoint
 }
 
 // ErrLocked 图层被锁定。
@@ -131,7 +140,7 @@ func Open(dir, kind string) (*Project, error) {
 	if err := os.MkdirAll(filepath.Join(abs, "layers"), 0o755); err != nil {
 		return nil, fmt.Errorf("创建工程目录: %w", err)
 	}
-	p := &Project{dir: abs, kind: kind}
+	p := &Project{dir: abs, kind: kind, id: rand.Text()}
 	raw, err := os.ReadFile(filepath.Join(abs, "project.json"))
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -148,6 +157,17 @@ func Open(dir, kind string) (*Project, error) {
 		var f File
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("project.json 格式错误: %w", err)
+		}
+		switch f.Engine {
+		case EnginePixel:
+			if err := checkPixelFile(f); err != nil {
+				return nil, err
+			}
+			f.Canvas = pixelCanvas(f.Pixel.Width, f.Pixel.Height)
+		case "", EngineSVG:
+			f.Pixel = nil
+		default:
+			return nil, fmt.Errorf("未知工程类型 %q", f.Engine)
 		}
 		p.file = normalizeFile(f, abs, kind)
 	}
@@ -239,6 +259,9 @@ func normalizeFile(f File, dir, kind string) File {
 
 // saveLocked 原子写 project.json（调用方须持锁）。
 func (p *Project) saveLocked() error {
+	if p.file.Pixel != nil {
+		return savePixelManifest(p.dir, p.file)
+	}
 	p.file.Modified = time.Now().UnixNano()
 	sortLayers(p.file.Layers)
 	raw, err := json.MarshalIndent(p.file, "", "  ")
@@ -295,6 +318,7 @@ func (p *Project) Meta() File {
 	defer p.mu.Unlock()
 	out := p.file
 	out.History = nil
+	out.Pixel = clonePixel(p.file.Pixel)
 	out.Layers = make([]Layer, len(p.file.Layers))
 	copy(out.Layers, p.file.Layers)
 	return out
@@ -304,6 +328,9 @@ func (p *Project) Meta() File {
 func (p *Project) SetCanvas(c CanvasMeta) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.file.Pixel != nil {
+		return ErrSVGProject
+	}
 	if c.Width <= 0 || c.Height <= 0 {
 		return errors.New("画布尺寸必须为正数")
 	}
@@ -337,7 +364,13 @@ func (p *Project) SaveAs(target string) error {
 	if err != nil {
 		return fmt.Errorf("解析目标路径: %w", err)
 	}
+	p.mu.Lock()
+	if p.file.Pixel != nil {
+		defer p.mu.Unlock()
+		return p.savePixelAsLocked(abs)
+	}
 	src, _ := filepath.Abs(p.dir)
+	p.mu.Unlock()
 	if abs == src {
 		// 同一个目录：只改类型，无需复制。
 		p.mu.Lock()
@@ -838,13 +871,17 @@ func (p *Project) History() []llm.Message {
 func (p *Project) SetHistory(msgs []llm.Message) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.file.History = historyRecords(msgs)
+	return p.saveLocked()
+}
+
+func historyRecords(msgs []llm.Message) []MessageRecord {
 	recs := make([]MessageRecord, 0, len(msgs))
 	now := time.Now().UnixNano()
 	for _, m := range msgs {
 		recs = append(recs, MessageRecord{Role: m.Role, Blocks: m.Blocks, Time: now, NativeOutput: m.NativeOutput})
 	}
-	p.file.History = recs
-	return p.saveLocked()
+	return recs
 }
 
 // ClearContext 清空对话历史，并记下时间戳（AI 下次据此重新读图层）。

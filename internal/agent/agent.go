@@ -1,4 +1,4 @@
-// Package agent 是 SVG 生成任务的 Agent 引擎：多轮模型循环 + 工具执行 + 上下文压缩。
+// Package agent runs model tool loops for SVG and pixel projects and manages their context.
 //
 // 本文件由 Lead 声明「契约」，agent-core 负责补齐实现；签名不得随意更改。
 package agent
@@ -10,6 +10,7 @@ import (
 
 	"svg-master/internal/config"
 	"svg-master/internal/llm"
+	"svg-master/internal/pixel"
 )
 
 // EventKind Agent 下行事件类型（api 层直接转 SSE）。
@@ -23,6 +24,7 @@ const (
 	EvSVG         = "svg" // 画布更新（完整 SVG）
 	EvCanvas      = "canvas"
 	EvLayers      = "layers" // 图层树更新（数组为 []LayerInfo）
+	EvPixelUpdate = "pixel_update"
 	EvUsage       = "usage"
 	EvServiceTier = "service_tier"
 	EvNudge       = "nudge" // 上下文压缩提醒
@@ -46,6 +48,7 @@ type Event struct {
 	SVG    string               `json:"svg,omitempty"`
 	Canvas *config.CanvasPreset `json:"canvas,omitempty"`
 	Layers []LayerInfo          `json:"layers,omitempty"`
+	Pixel  any                  `json:"pixel,omitempty"`
 	// 会话（连续对话标识，done 事件回传给前端）
 	Session string `json:"session,omitempty"`
 	// 用量/统计
@@ -81,6 +84,7 @@ type Task struct {
 	Model   string              `json:"model"`
 	System  string              `json:"system,omitempty"` // 额外系统提示（可选）
 	Session string              `json:"session,omitempty"`
+	Pixel   *PixelInput         `json:"-"`
 	// History 跨请求延续的历史消息（连续对话模式）；引擎把它拼在本次输入之前，
 	// 运行结束后可通过 Engine.History() 取回完整历史（含本轮）。
 	History []llm.Message `json:"-"`
@@ -102,6 +106,8 @@ type Deps struct {
 	Layers LayerBridge
 	// LayerTools 是否下发图层读写工具（由多步开关 + 图层总开关共同决定）。
 	LayerTools bool
+	Pixel      PixelBridge
+	Vision     bool
 	// ContextClearedAt 用户最近一次清空上下文的时间（UnixNano），非 0 时注入提醒，
 	// 要求模型先读图层再动手。
 	ContextClearedAt int64
@@ -215,15 +221,16 @@ type LayerBridge interface {
 
 // LayerInfo 图层元信息的传输结构。
 type LayerInfo struct {
-	ID       string  `json:"id"`
-	Name     string  `json:"name"`
-	Visible  bool    `json:"visible"`
-	Locked   bool    `json:"locked"`
-	Opacity  float64 `json:"opacity"`
-	Blend    string  `json:"blend"`
-	Index    int     `json:"index"`
-	Bytes    int     `json:"bytes,omitempty"`
-	Elements int     `json:"elements,omitempty"`
+	ID       string      `json:"id"`
+	Name     string      `json:"name"`
+	Visible  bool        `json:"visible"`
+	Locked   bool        `json:"locked"`
+	Opacity  float64     `json:"opacity"`
+	Blend    string      `json:"blend"`
+	Index    int         `json:"index"`
+	Bytes    int         `json:"bytes,omitempty"`
+	Elements int         `json:"elements,omitempty"`
+	Region   *pixel.Rect `json:"region,omitempty"`
 }
 
 // LayerPatch 图层属性增量（nil = 不改）。

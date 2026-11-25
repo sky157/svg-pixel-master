@@ -216,6 +216,9 @@ func reDecode(in Settings, key []byte) Settings {
 // Normalize 修正非法值并补齐缺省；prev 用于把打码 Key 还原成原值。
 func Normalize(in Settings, prev Settings) (Settings, error) {
 	out := in
+	if out.Workspace != "pixel" {
+		out.Workspace = "svg"
+	}
 	out.Version = SettingsVersion
 	if len(out.Providers) == 0 {
 		out.Providers = DefaultSettings().Providers

@@ -192,7 +192,7 @@ func (s *Server) Project() *project.Project {
 
 // projectBridge 返回当前工程的桥接（未打开时为 nil）。
 func (s *Server) projectBridge() agent.LayerBridge {
-	if p := s.Project(); p != nil {
+	if p := s.Project(); p != nil && p.Engine() == project.EngineSVG {
 		return bridge{p: p}
 	}
 	return nil
@@ -232,49 +232,76 @@ func (s *Server) openQuick(fresh bool) error {
 	s.proj.dirty = false
 	s.proj.mu.Unlock()
 
-	st.Project.Mode = config.ModeQuick
+	st.Project.Mode, st.Workspace = config.ModeQuick, project.EngineSVG
 	if err := s.store.Save(st); err != nil {
 		_ = err
 	}
 	return nil
 }
 
-// openProject 打开工程模式下的一个工程文件夹。
-func (s *Server) openProject(dir string) error {
+func (s *Server) openPixelQuick(fresh bool) error {
+	p, err := project.OpenQuickPixel(s.store.Dir(), false)
+	if err != nil {
+		return err
+	}
+	if err := s.closeProject(false); err != nil {
+		return err
+	}
+	if fresh {
+		if err := p.ResetPixel(); err != nil {
+			return err
+		}
+	}
+	s.proj.mu.Lock()
+	s.proj.p, s.proj.mode, s.proj.dirty = p, config.ModeQuick, false
+	s.proj.mu.Unlock()
+	st := s.store.Settings()
+	st.Project.Mode, st.Workspace = config.ModeQuick, project.EnginePixel
+	_ = s.store.Save(st)
+	return nil
+}
+
+func (s *Server) openProject(dir string, expected ...string) error {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return fmt.Errorf("工程目录不能为空")
+	}
+	if len(expected) > 0 && expected[0] == project.EnginePixel {
+		if _, err := os.Stat(filepath.Join(dir, "project.json")); err != nil {
+			return fmt.Errorf("请选择已有的像素工程文件夹: %w", err)
+		}
 	}
 	p, err := project.Open(dir, project.KindUser)
 	if err != nil {
 		return err
 	}
-	s.proj.mu.Lock()
-	s.proj.p = p
-	s.proj.mode = config.ModeProject
-	s.proj.dirty = false
-	s.proj.mu.Unlock()
-
-	// 记入最近列表，方便下次启动直接选。
-	st := s.store.Settings()
-	abs, _ := filepath.Abs(dir)
-	st.Project.Mode = config.ModeProject
-	st.Project.LastProject = abs
-	st.Project.Recent = pushRecent(st.Project.Recent, abs)
-	if err := s.store.Save(st); err != nil {
-		// 保存失败不影响工程本身，只丢「最近打开」记录。
-		_ = err
+	if len(expected) > 0 && expected[0] != "" && p.Engine() != expected[0] {
+		return fmt.Errorf("该工程属于 %s 工作区，请在对应工作区打开", p.Engine())
 	}
+	old := s.Project()
+	purgeQuick := old != nil && old.Dir() != p.Dir() && old.Engine() == project.EngineSVG && p.Engine() == project.EngineSVG
+	if err := s.closeProject(purgeQuick); err != nil {
+		return err
+	}
+	s.installNamedProject(p)
 	return nil
 }
 
-// closeProject 关闭当前工程（快速模式删除临时目录）。
+func (s *Server) installNamedProject(p *project.Project) {
+	s.proj.mu.Lock()
+	s.proj.p, s.proj.mode, s.proj.dirty = p, config.ModeProject, false
+	s.proj.mu.Unlock()
+	st := s.store.Settings()
+	st.Project.Mode, st.Workspace = config.ModeProject, p.Engine()
+	st.Project.LastProject = p.Dir()
+	st.Project.Recent = pushRecent(st.Project.Recent, p.Dir())
+	_ = s.store.Save(st)
+}
+
 func (s *Server) closeProject(purgeQuick bool) error {
 	s.proj.mu.Lock()
+	defer s.proj.mu.Unlock()
 	p, mode := s.proj.p, s.proj.mode
-	s.proj.p = nil
-	s.proj.dirty = false
-	s.proj.mu.Unlock()
 	if p == nil {
 		return nil
 	}
@@ -282,8 +309,15 @@ func (s *Server) closeProject(purgeQuick bool) error {
 		return err
 	}
 	if purgeQuick && mode == config.ModeQuick {
-		return project.PurgeQuick(s.store.Dir())
+		if p.Engine() == project.EnginePixel {
+			if err := p.ResetPixel(); err != nil {
+				return err
+			}
+		} else if err := project.PurgeQuick(s.store.Dir()); err != nil {
+			return err
+		}
 	}
+	s.proj.p, s.proj.dirty = nil, false
 	return nil
 }
 
@@ -315,18 +349,6 @@ func (s *Server) sessionHistory() []llm.Message {
 		return nil
 	}
 	return p.History()
-}
-
-// saveSession 把对话历史写回工程。
-func (s *Server) saveSession(msgs []llm.Message) {
-	p := s.Project()
-	if p == nil {
-		return
-	}
-	if err := p.SetHistory(msgs); err != nil {
-		return
-	}
-	s.markDirty()
 }
 
 // clearContext 清空对话上下文（工程文件与图层保留）。
@@ -395,7 +417,7 @@ func (s *Server) setProjectCanvas(c config.CanvasPreset) error {
 
 // renderCurrent 当前工程的合成 SVG（空工程返回空串）。
 func (s *Server) renderCurrent() string {
-	if p := s.Project(); p != nil {
+	if p := s.Project(); p != nil && p.Engine() == project.EngineSVG {
 		return p.Render()
 	}
 	return ""

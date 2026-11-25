@@ -13,6 +13,7 @@ import (
 	"svg-master/internal/agent"
 	"svg-master/internal/config"
 	"svg-master/internal/llm"
+	"svg-master/internal/project"
 	"svg-master/internal/svg"
 )
 
@@ -34,6 +35,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
+		pixelChatFields
 		Prompt    string              `json:"prompt"`
 		Images    []llm.ImageData     `json:"images"`
 		Canvas    config.CanvasPreset `json:"canvas"`
@@ -54,6 +56,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	proj := s.Project()
 	if proj == nil {
 		writeErr(w, http.StatusBadRequest, "尚未打开工程：请先选择快速模式或打开一个工程文件夹")
+		return
+	}
+	isPixel := proj.Engine() == project.EnginePixel
+	if !projectEngineOK(in.Engine) || isPixel != (in.Engine == project.EnginePixel) {
+		writeErr(w, http.StatusConflict, "请求工作区与当前工程类型不一致")
 		return
 	}
 	st := s.store.Settings()
@@ -79,7 +86,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	// 画布以工程为准（工程自带 canvas，避免「设置里改了但作品没变」）。
 	canvas := s.projectCanvas()
-	if in.Canvas.Width > 0 && in.Canvas.Height > 0 {
+	if !isPixel && in.Canvas.Width > 0 && in.Canvas.Height > 0 {
 		canvas = in.Canvas
 	}
 	thinking := in.Thinking
@@ -134,29 +141,44 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	agentSettings = config.NormalizeGenMode(agentSettings)
 	// 只有多图层模式才下发图层工具；动图模式仍是单图层，刻意不给图层工具。
-	layerTools := agentSettings.GenMode == config.GenModeLayers && st.Layers.Enabled
-	// 前端选中了某个图层时，让模型从这一层开始干活。
-	if in.Layer != "" {
-		if br := s.projectBridge(); br != nil {
-			if err := br.SetActive(in.Layer); err != nil {
-				// 图层已被删除等情况下不阻断本次生成，只是把焦点还给当前层。
-				_ = err
-			}
-		}
-	}
-
+	layerTools := !isPixel && agentSettings.GenMode == config.GenModeLayers && st.Layers.Enabled
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeErr(w, http.StatusInternalServerError, "服务器不支持流式响应")
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	handle := &engineHandle{Abort: cancel, RunID: in.RunID, Done: make(chan struct{})}
+	s.mu.Lock()
+	if s.resetting || len(s.engines) > 0 || s.Project() != proj {
+		s.mu.Unlock()
+		writeErr(w, http.StatusConflict, "工程已切换或上一个任务仍在结束，请同步后重试")
+		return
+	}
+	if isPixel {
+		if time.Now().Before(s.pixelStopped[in.RunID]) {
+			delete(s.pixelStopped, in.RunID)
+			s.mu.Unlock()
+			writeErr(w, http.StatusConflict, "该任务已停止")
+			return
+		}
+		if err := proj.CheckPixelRevision(in.pixelVersion.ID, in.Revision); err != nil {
+			s.mu.Unlock()
+			pixelError(w, err)
+			return
+		}
+	}
+	s.engines[session] = handle
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		if s.engines[session] == handle {
+			delete(s.engines, session)
+		}
+		close(handle.Done)
+		s.mu.Unlock()
+	}()
 
 	var writeMu sync.Mutex
 	writeFrame := func(frame string) {
@@ -198,6 +220,33 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		send(ev)
 	}
 
+	var pixelRun *pixelAgentBridge
+	var pixelBridge agent.PixelBridge
+	var pixelInput *agent.PixelInput
+	if isPixel {
+		var err error
+		pixelRun, pixelInput, in.Prompt, err = s.preparePixelChat(ctx, proj, in.pixelChatFields, in.Prompt, caps.Vision, emit)
+		if err != nil {
+			pixelError(w, err)
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if err := proj.BeginPixelTurn(pixelInput.DraftMode); err != nil {
+			pixelError(w, err)
+			return
+		}
+		pixelBridge = pixelRun
+	} else if in.Layer != "" {
+		// An outdated active-layer hint does not prevent SVG generation.
+		_ = proj.SetActive(in.Layer)
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
 	eng := agent.New(agent.Deps{
 		Client:           client,
 		Settings:         agentSettings,
@@ -210,29 +259,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Emit:             emit,
 		Layers:           s.projectBridge(),
 		LayerTools:       layerTools,
-		ContextClearedAt: s.contextClearedAt(),
+		ContextClearedAt: proj.ContextClearedAt(),
+		Pixel:            pixelBridge,
+		Vision:           caps.Vision,
 	})
-	// 直接取消请求 context，即便 Engine 尚未进入 Run 也能停止。
-	handle := &engineHandle{Abort: cancel, RunID: in.RunID, Done: make(chan struct{})}
-	s.mu.Lock()
-	if s.resetting || len(s.engines) > 0 {
-		s.mu.Unlock()
-		writeErr(w, http.StatusConflict, "上一个任务仍在结束，请稍后重试")
-		return
-	}
-	s.engines[session] = handle
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		if s.engines[session] == handle {
-			delete(s.engines, session)
-		}
-		close(handle.Done)
-		s.mu.Unlock()
-	}()
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush() // 注册后立即发送响应头，停止不必等模型产生首条事件。
-	history := s.sessionHistory()
+	history := proj.History()
 
 	// SSE 心跳：15s 一次注释行，防止中间层断连
 	hb := time.NewTicker(15 * time.Second)
@@ -258,9 +291,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Model:   model,
 		Session: session,
 		History: history,
+		Pixel:   pixelInput,
 	})
-	// 任务结束后把完整历史写回工程（工程模式下同时落盘）。
-	s.saveSession(eng.History())
+	if isPixel {
+		if saveErr := proj.EndPixelTurn(eng.History(), err == nil); saveErr != nil && err == nil {
+			err = saveErr
+		}
+		pixelRun.changed("", nil)
+	} else if proj.SetHistory(eng.History()) == nil {
+		s.markDirty()
+	}
 	if err != nil {
 		send(agent.Event{Kind: agent.EvError, Error: err.Error(), Usage: &stats})
 		return
@@ -277,6 +317,7 @@ func (s *Server) handleAbort(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Session string `json:"session"`
 		RunID   string `json:"runId"`
+		Wait    bool   `json:"wait"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -284,12 +325,48 @@ func (s *Server) handleAbort(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	h := s.engines[in.Session]
+	matches := h != nil && h.Abort != nil && (in.RunID == "" || h.RunID == in.RunID)
+	if in.Wait && !matches && len(s.engines) > 0 {
+		s.mu.Unlock()
+		writeErr(w, http.StatusConflict, "当前有另一项生成任务，请重新同步画布")
+		return
+	}
+	if in.Wait && !matches && in.RunID != "" {
+		now := time.Now()
+		for id, expiry := range s.pixelStopped {
+			if !now.Before(expiry) {
+				delete(s.pixelStopped, id)
+			}
+		}
+		if s.pixelStopped == nil {
+			s.pixelStopped = make(map[string]time.Time)
+		}
+		if len(s.pixelStopped) < 256 {
+			s.pixelStopped[in.RunID] = now.Add(time.Minute)
+		}
+	}
 	s.mu.Unlock()
-	if h == nil || h.Abort == nil || (in.RunID != "" && h.RunID != in.RunID) {
+	if matches {
+		h.Abort()
+	}
+	if in.Wait {
+		if matches {
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			defer cancel()
+			select {
+			case <-h.Done:
+			case <-ctx.Done():
+				writeErr(w, http.StatusConflict, "任务尚未完全停止，请重新同步画布")
+				return
+			}
+		}
+		writeJSON(w, map[string]any{"ok": true, "project": s.snapshot()})
+		return
+	}
+	if !matches {
 		writeJSON(w, map[string]any{"ok": false, "msg": "没有运行中的任务"})
 		return
 	}
-	h.Abort()
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -326,11 +403,21 @@ func (s *Server) handleSessionDrop(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if p := s.Project(); p != nil {
-		if err := p.ResetContent(); err != nil {
+		var err error
+		if p.Engine() == project.EnginePixel {
+			err = p.ResetPixel()
+		} else {
+			err = p.ResetContent()
+		}
+		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		s.markDirty()
+		if p.Engine() == project.EnginePixel {
+			s.markPixelDirty(p)
+		} else {
+			s.markDirty()
+		}
 	}
 	writeJSON(w, map[string]any{"ok": true, "resetCanvas": true, "project": s.snapshot()})
 }
@@ -381,6 +468,10 @@ func (s *Server) handleRenderResult(w http.ResponseWriter, r *http.Request) {
 //
 // 不再改写内容：只做外壳剥离（围栏/闲话），SVG 本体与交付内容逐字一致。
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	if p := s.Project(); p != nil && p.Engine() == project.EnginePixel {
+		pixelError(w, project.ErrSVGProject)
+		return
+	}
 	var in struct {
 		SVG string `json:"svg"`
 	}

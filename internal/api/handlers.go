@@ -6,6 +6,7 @@ import (
 
 	"svg-master/internal/config"
 	"svg-master/internal/llm"
+	"svg-master/internal/project"
 	"svg-master/internal/svg"
 )
 
@@ -159,6 +160,10 @@ func (s *Server) handleCanvas(w http.ResponseWriter, r *http.Request) {
 // handleValidate 校验一段 SVG（前端手动触发）。
 // 与 emit_svg 同一套规则：只判「是不是 SVG」与「尺寸是否等于当前画布」，不改写内容。
 func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
+	if p := s.Project(); p != nil && p.Engine() == project.EnginePixel {
+		pixelError(w, project.ErrSVGProject)
+		return
+	}
 	var in struct {
 		SVG string `json:"svg"`
 	}

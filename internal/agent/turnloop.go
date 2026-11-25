@@ -270,7 +270,7 @@ func (e *Engine) handleStreamEvent(ev llm.StreamEvent, res *streamResult, accs m
 			acc.hasArgs = true
 			// emit_svg 的参数里就是整段 SVG：边收边抽出已到达的部分推给上层，
 			// 前端据此做「补全渲染」，实现逐笔长出来的实时预览。
-			if acc.name == ToolEmitSVG {
+			if e.deps.Pixel == nil && acc.name == ToolEmitSVG {
 				e.emitSVGPreview(acc)
 			}
 		}

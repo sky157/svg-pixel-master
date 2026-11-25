@@ -109,18 +109,29 @@ func encodeChatMessage(m Message) []chatMessageOut {
 	switch m.Role {
 	case RoleTool:
 		var outs []chatMessageOut
+		var images []chatPartOut
 		for _, b := range m.Blocks {
 			if b.Type != BlockToolResult || b.ToolResult == nil {
 				continue
 			}
+			result := b.ToolResult
 			outs = append(outs, chatMessageOut{
 				Role:       RoleTool,
-				Content:    toolResultText(b.ToolResult),
-				ToolCallID: b.ToolResult.CallID,
+				Content:    toolResultText(result),
+				ToolCallID: result.CallID,
 			})
+			for _, img := range result.Images {
+				if img.Data != "" {
+					images = append(images, chatPartOut{Type: "text", Text: toolImageCaption(result)}, chatImagePart(img))
+				}
+			}
 		}
 		if len(outs) == 0 {
 			return []chatMessageOut{{Role: RoleTool, Content: m.Text()}}
+		}
+		// All tool results for an assistant message must precede the synthetic image message.
+		if len(images) > 0 {
+			outs = append(outs, chatMessageOut{Role: RoleUser, Content: images})
 		}
 		return outs
 	}
@@ -145,13 +156,7 @@ func encodeChatMessage(m Message) []chatMessageOut {
 				continue
 			}
 			multimodal = true
-			var p chatPartOut
-			p.Type = "image_url"
-			p.ImageURL = &struct {
-				URL    string `json:"url"`
-				Detail string `json:"detail,omitempty"`
-			}{URL: imageDataURL(*b.Image)}
-			parts = append(parts, p)
+			parts = append(parts, chatImagePart(*b.Image))
 		case BlockToolCall:
 			if b.ToolCall == nil {
 				continue
@@ -423,16 +428,14 @@ func rawArgsString(raw json.RawMessage) string {
 	return s
 }
 
-// imageDataURL 生成 data URL。
-func imageDataURL(img ImageData) string {
-	mime := img.MIME
-	if mime == "" {
-		mime = "image/png"
-	}
-	return "data:" + mime + ";base64," + img.Data
+func chatImagePart(img ImageData) chatPartOut {
+	return chatPartOut{Type: "image_url", ImageURL: &struct {
+		URL    string `json:"url"`
+		Detail string `json:"detail,omitempty"`
+	}{URL: img.DataURL()}}
 }
 
-// toolResultText 工具结果文本，附图片占位说明（chat 协议 tool 消息不支持图片）。
+// toolResultText renders the text (and failure marker) before protocol-specific media encoding.
 func toolResultText(tr *ToolResult) string {
 	if tr == nil {
 		return ""
@@ -441,8 +444,9 @@ func toolResultText(tr *ToolResult) string {
 	if tr.IsError && !strings.HasPrefix(out, "错误") {
 		out = "错误：" + out
 	}
-	if len(tr.Images) > 0 {
-		out += fmt.Sprintf("\n[附 %d 张图片，当前协议不支持在工具结果中回传图片]", len(tr.Images))
-	}
 	return out
+}
+
+func toolImageCaption(tr *ToolResult) string {
+	return fmt.Sprintf("[工具 %s 返回的图片，调用 %s]", tr.Name, tr.CallID)
 }

@@ -180,6 +180,9 @@ func openAIResponses(w http.ResponseWriter, r *http.Request) {
 	var body map[string]any
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	sse(w)
+	if pixelResponses(w, body) {
+		return
+	}
 
 	if needsTool(body) {
 		args := mustJSON(map[string]any{"svg": pelicanSVG, "note": "pelican on a bicycle"})
@@ -206,6 +209,74 @@ func openAIResponses(w http.ResponseWriter, r *http.Request) {
 	emit(w, "response.completed", map[string]any{"type": "response.completed", "response": map[string]any{
 		"id": "resp_2", "status": "completed",
 		"usage": map[string]any{"input_tokens": 620, "output_tokens": 42, "total_tokens": 662}}})
+}
+
+// pixelResponses uses the most recent user turn to exercise draw, inspect and the image output.
+func pixelResponses(w http.ResponseWriter, body map[string]any) bool {
+	tools, _ := body["tools"].([]any)
+	pixelMode := false
+	for _, item := range tools {
+		tool, _ := item.(map[string]any)
+		if tool["name"] == "pixel_draw" {
+			pixelMode = true
+			break
+		}
+	}
+	if !pixelMode {
+		return false
+	}
+	input, _ := body["input"].([]any)
+	turn, step := 0, 0
+	for _, item := range input {
+		message, _ := item.(map[string]any)
+		if message["role"] == "user" {
+			parts, _ := message["content"].([]any)
+			for _, part := range parts {
+				block, _ := part.(map[string]any)
+				text, _ := block["text"].(string)
+				if strings.HasPrefix(text, "[用户指令]") {
+					turn++
+					break
+				}
+			}
+			step = 0
+		}
+		if message["type"] == "function_call_output" {
+			step++
+		}
+	}
+	responseID := fmt.Sprintf("pixel_%d_%d", turn, step)
+	emit(w, "response.created", map[string]any{
+		"type": "response.created", "response": map[string]any{"id": responseID},
+	})
+	if step < 2 {
+		name, args := "pixel_inspect", map[string]any{"mode": "composite"}
+		if step == 0 {
+			name = "pixel_draw"
+			args = map[string]any{"ops": []any{
+				map[string]any{"op": "rect", "x": 0, "y": 0, "w": 48, "h": 48, "color": []string{"#FF477E", "#21DA78", "#4567DC"}[(max(1, turn)-1)%3], "fill": true},
+			}}
+		}
+		emit(w, "response.output_item.done", map[string]any{
+			"type": "response.output_item.done", "output_index": 0,
+			"item": map[string]any{
+				"type": "function_call", "id": "fc_" + responseID, "call_id": "call_" + responseID,
+				"name": name, "arguments": mustJSON(args),
+			},
+		})
+	} else {
+		emit(w, "response.output_text.delta", map[string]any{
+			"type": "response.output_text.delta", "output_index": 0,
+			"content_index": 0, "delta": "已完成像素修改并检查画布。",
+		})
+	}
+	emit(w, "response.completed", map[string]any{
+		"type": "response.completed", "response": map[string]any{
+			"id": responseID, "status": "completed",
+			"usage": map[string]any{"input_tokens": 420, "output_tokens": 96, "total_tokens": 516},
+		},
+	})
+	return true
 }
 
 // ---------- Anthropic Messages ----------

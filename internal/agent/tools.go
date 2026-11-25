@@ -57,18 +57,6 @@ func emitSVGSpec(layers bool) llm.ToolSpec {
 func toolSpecs(deps Deps) []llm.ToolSpec {
 	layers := layerToolsEnabled(deps)
 	specs := []llm.ToolSpec{
-		emitSVGSpec(layers),
-		{
-			Name:        ToolValidateSVG,
-			Description: "校验 SVG 结构并返回报告（不修改画布）。用于交付前自检。",
-			Parameters: json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "svg": {"type": "string", "description": "待校验的 SVG 源码"}
-  },
-  "required": ["svg"]
-}`),
-		},
 		{
 			Name:        ToolCompress,
 			Description: "把一段连续消息折叠成摘要块，释放上下文。summary 由你撰写，必须保留已确定的决定与关键参数。",
@@ -147,6 +135,24 @@ func toolSpecs(deps Deps) []llm.ToolSpec {
 		specs = keep
 	}
 
+	if deps.Pixel != nil {
+		return append(pixelToolSpecs(), specs...)
+	}
+	specs = append([]llm.ToolSpec{
+		emitSVGSpec(layers),
+		{
+			Name:        ToolValidateSVG,
+			Description: "校验 SVG 结构并返回报告（不修改画布）。用于交付前自检。",
+			Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "svg": {"type": "string", "description": "待校验的 SVG 源码"}
+  },
+  "required": ["svg"]
+}`),
+		},
+	}, specs...)
+
 	// 图层工具：生成方式为多图层 + 图层总开关都打开、且工程已就绪时才下发。
 	// 动图模式刻意不下发图层工具——它要的是「一个图层里的会动的画面」。
 	if layers {
@@ -157,7 +163,7 @@ func toolSpecs(deps Deps) []llm.ToolSpec {
 
 // layerToolsEnabled 图层读写工具是否可用：调用方开关 + 工程就绪 + 生成方式为多图层。
 func layerToolsEnabled(deps Deps) bool {
-	if !deps.LayerTools || deps.Layers == nil {
+	if deps.Pixel != nil || !deps.LayerTools || deps.Layers == nil {
 		return false
 	}
 	return config.NormalizeGenMode(deps.Settings).GenMode == config.GenModeLayers
@@ -178,15 +184,25 @@ func isDeliveryTool(name string) bool {
 
 // toolOutcome 一次工具执行结果。
 type toolOutcome struct {
-	Content string
-	IsError bool
+	Content      string
+	IsError      bool
+	Images       []llm.ImageData
+	PixelChanged bool
 }
 
 // runTool 按名字分发工具调用。
-func (e *Engine) runTool(ctx context.Context, call llm.ToolCall) toolOutcome {
+func (e *Engine) runTool(ctx context.Context, call llm.ToolCall, input PixelInput) toolOutcome {
 	args := call.Arguments
 	if len(args) == 0 {
 		args = json.RawMessage("{}")
+	}
+	if e.deps.Pixel != nil {
+		if isPixelTool(call.Name) {
+			return e.runPixelTool(call, args, input)
+		}
+		if call.Name == ToolEmitSVG || call.Name == ToolValidateSVG || isLayerTool(call.Name) {
+			return toolOutcome{Content: "当前像素工程只接受像素绘图工具。", IsError: true}
+		}
 	}
 	switch call.Name {
 	case ToolEmitSVG:
@@ -212,6 +228,13 @@ func (e *Engine) runTool(ctx context.Context, call llm.ToolCall) toolOutcome {
 
 // toolNames 可用工具名拼接（用于错误提示）。
 func toolNames(deps Deps) []string {
+	if deps.Pixel != nil {
+		var names []string
+		for _, spec := range toolSpecs(deps) {
+			names = append(names, spec.Name)
+		}
+		return names
+	}
 	names := []string{
 		ToolEmitSVG, ToolValidateSVG,
 		ToolCompress, ToolDecompress, ToolSearchContext, ToolACPStatus, ToolAskUser,

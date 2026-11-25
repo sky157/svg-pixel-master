@@ -275,6 +275,7 @@ type ProjectSettings struct {
 
 // Settings 全部持久化设置。
 type Settings struct {
+	Workspace        string          `json:"workspace"`
 	Version          int             `json:"version"`
 	Providers        []Provider      `json:"providers"`
 	ActiveProviderID string          `json:"activeProviderId"`
@@ -292,7 +293,8 @@ type Settings struct {
 // DefaultSettings 出厂默认：一个指向 OpenAI 官方地址的空供应商，方便用户直接填 Key。
 func DefaultSettings() Settings {
 	return Settings{
-		Version: 4,
+		Version:   4,
+		Workspace: "svg",
 		Providers: []Provider{{
 			ID:       "p1",
 			Name:     "OpenAI",
@@ -326,6 +328,7 @@ func DefaultSettings() Settings {
 // SettingsPatch 增量更新：所有字段为 nil 表示「本次不改」。
 // PUT /api/settings 走这个语义，避免前端只传几个字段时把整个配置覆盖掉。
 type SettingsPatch struct {
+	Workspace        *string          `json:"workspace,omitempty"`
 	Version          *int             `json:"version,omitempty"`
 	Providers        *[]Provider      `json:"providers,omitempty"`
 	ActiveProviderID *string          `json:"activeProviderId,omitempty"`
@@ -343,6 +346,9 @@ type SettingsPatch struct {
 // Apply 把增量合并到基线设置上并返回新副本。
 func (p SettingsPatch) Apply(base Settings) Settings {
 	out := base
+	if p.Workspace != nil {
+		out.Workspace = *p.Workspace
+	}
 	if p.Version != nil {
 		out.Version = *p.Version
 	}
@@ -384,7 +390,7 @@ func (p SettingsPatch) Apply(base Settings) Settings {
 
 // Empty 判断增量是否什么都没带（避免空请求也触发一次落盘）。
 func (p SettingsPatch) Empty() bool {
-	return p.Version == nil && p.Providers == nil && p.ActiveProviderID == nil &&
+	return p.Workspace == nil && p.Version == nil && p.Providers == nil && p.ActiveProviderID == nil &&
 		p.ActiveModel == nil && p.Thinking == nil && p.FastMode == nil && p.ExtendedThinking == nil && p.Agent == nil &&
 		p.Layers == nil && p.Project == nil && p.Canvas == nil && p.Export == nil
 }

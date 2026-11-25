@@ -16,20 +16,23 @@ import (
 // ModelClient lets SVG Master's existing agent execute dynamic tools, while Codex
 // owns the authenticated model connection and the in-flight turn.
 type ModelClient struct {
-	m        *Manager
-	provider string
-	c        *client
-	thread   string
-	turn     string
-	events   chan rpcReply
-	life     context.Context
-	cancel   context.CancelFunc
-	mu       sync.Mutex
-	pending  *rpcReply
-	callID   string
-	finished bool
-	usage    llm.Usage
+	m               *Manager
+	provider        string
+	c               *client
+	thread          string
+	turn            string
+	events          chan rpcReply
+	life            context.Context
+	cancel          context.CancelFunc
+	mu              sync.Mutex
+	pending         *rpcReply
+	callID          string
+	finished        bool
+	usage           llm.Usage
+	pixelImageBytes int
 }
+
+const maxCodexPixelImageBytes = 16 << 20
 
 func (m *Manager) Client(id string) *ModelClient {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -91,8 +94,22 @@ func (a *ModelClient) Stream(ctx context.Context, req llm.Request) (stream <-cha
 			return nil, errors.New("缺少 Codex 绘图工具结果")
 		}
 		items := []map[string]any{{"type": "inputText", "text": result.Content}}
+		omitted := false
 		for _, img := range result.Images {
-			items = append(items, map[string]any{"type": "inputImage", "imageUrl": "data:" + img.MIME + ";base64," + img.Data})
+			if img.Data == "" {
+				continue
+			}
+			if req.Pixel && a.pixelImageBytes+len(img.Data) > maxCodexPixelImageBytes {
+				omitted = true
+				continue
+			}
+			a.pixelImageBytes += len(img.Data)
+			items = append(items, map[string]any{"type": "inputImage", "imageUrl": img.DataURL()})
+		}
+		if omitted {
+			items = append(items, map[string]any{
+				"type": "inputText", "text": "本轮的检验图已达到图片预算。使用上方统计和 pixel_read_region 核对后续改动。",
+			})
 		}
 		if err := a.c.write(map[string]any{"id": a.pending.ID, "result": map[string]any{"contentItems": items, "success": !result.IsError}}); err != nil {
 			return nil, err
@@ -111,14 +128,34 @@ func (a *ModelClient) begin(ctx context.Context, req llm.Request) error {
 	for _, t := range req.Tools {
 		tools = append(tools, map[string]any{"type": "function", "name": t.Name, "description": t.Description, "inputSchema": t.Parameters})
 	}
+	instructions := "Use only svg_master tools to create or edit SVG. All project operations are handled by these tools."
+	description := "SVG Master drawing tools"
+	if req.Pixel {
+		instructions = "Use only svg_master tools to inspect and edit the layered pixel artwork. All project operations are handled by these tools."
+		description = "SVG Master Pixel Studio tools"
+		// Codex keeps accepted attachments in this thread. The Agent cannot
+		// remove them by pruning the projected messages in later RPC calls.
+		for _, msg := range req.Messages {
+			for _, block := range msg.Blocks {
+				if block.Image != nil {
+					a.pixelImageBytes += len(block.Image.Data)
+				}
+				if block.ToolResult != nil {
+					for _, img := range block.ToolResult.Images {
+						a.pixelImageBytes += len(img.Data)
+					}
+				}
+			}
+		}
+	}
 	params := map[string]any{
 		"model": req.Model, "ephemeral": true,
 		"sandbox": "read-only", "approvalPolicy": "never",
 		"baseInstructions":      req.System,
-		"developerInstructions": "Use only svg_master tools to create or edit SVG. All project operations are handled by these tools.",
+		"developerInstructions": instructions,
 		"environments":          []any{},
 		"dynamicTools": []any{map[string]any{
-			"type": "namespace", "name": "svg_master", "description": "SVG Master drawing tools", "tools": tools,
+			"type": "namespace", "name": "svg_master", "description": description, "tools": tools,
 		}},
 		"config": map[string]any{
 			"features.shell_tool": false, "features.multi_agent": false,
@@ -161,8 +198,8 @@ func (a *ModelClient) begin(ctx context.Context, req llm.Request) error {
 		if b.Type == llm.BlockText {
 			input = append(input, map[string]any{"type": "text", "text": b.Text})
 		}
-		if b.Image != nil {
-			input = append(input, map[string]any{"type": "image", "url": "data:" + b.Image.MIME + ";base64," + b.Image.Data})
+		if b.Image != nil && b.Image.Data != "" {
+			input = append(input, map[string]any{"type": "image", "url": b.Image.DataURL()})
 		}
 	}
 	turn := map[string]any{"threadId": a.thread, "input": input, "summary": "auto"}
@@ -321,14 +358,15 @@ func historyItems(messages []llm.Message) ([]map[string]any, error) {
 				}
 				parts = append(parts, map[string]any{"type": kind, "text": b.Text})
 			case llm.BlockImage:
-				if b.Image != nil {
-					parts = append(parts, map[string]any{"type": "input_image", "image_url": "data:" + b.Image.MIME + ";base64," + b.Image.Data})
+				if b.Image != nil && b.Image.Data != "" {
+					parts = append(parts, map[string]any{"type": "input_image", "image_url": b.Image.DataURL()})
 				}
 			}
 		}
 		if len(parts) > 0 {
 			items = append(items, map[string]any{"type": "message", "role": role, "content": parts})
 		}
+		var toolImages []map[string]any
 		for _, b := range m.Blocks {
 			if b.ToolCall != nil {
 				t := b.ToolCall
@@ -340,7 +378,18 @@ func historyItems(messages []llm.Message) ([]map[string]any, error) {
 			if b.ToolResult != nil {
 				t := b.ToolResult
 				items = append(items, map[string]any{"type": "function_call_output", "call_id": t.CallID, "output": t.Content})
+				for _, img := range t.Images {
+					if img.Data != "" {
+						toolImages = append(toolImages,
+							map[string]any{"type": "input_text", "text": fmt.Sprintf("[工具 %s 返回的图片，调用 %s]", t.Name, t.CallID)},
+							map[string]any{"type": "input_image", "image_url": img.DataURL()},
+						)
+					}
+				}
 			}
+		}
+		if len(toolImages) > 0 {
+			items = append(items, map[string]any{"type": "message", "role": "user", "content": toolImages})
 		}
 	}
 	return items, nil

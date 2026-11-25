@@ -81,8 +81,15 @@ func (c *anthropicClient) buildBody(req Request) ([]byte, error) {
 			Type string `json:"type"`
 		}{Type: "ephemeral"}}}
 	}
-	for _, m := range req.Messages {
+	for i, m := range req.Messages {
 		if msg, ok := encodeAnthropicMessage(m); ok {
+			if i == 0 && req.PixelAssetPrefix {
+				if blocks, ok := msg.Content.([]anthropicBlockOut); ok && len(blocks) > 0 {
+					blocks[len(blocks)-1].CacheControl = &struct {
+						Type string `json:"type"`
+					}{Type: "ephemeral"}
+				}
+			}
 			out.Messages = append(out.Messages, msg)
 		}
 	}
